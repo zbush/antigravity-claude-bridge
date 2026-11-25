@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "claude-local": {
+      "command": "node",
+      "args": [
+        "server/index.mjs"
+      ],
+      "env": {
+        "AGENT_BRIDGE_ROLE": "independent",
+        "AGENT_BRIDGE_MAX_CONCURRENT": "4"
+      }
+    }
+  }
+}

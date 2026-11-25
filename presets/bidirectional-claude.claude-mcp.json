@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "antigravity": {
+      "command": "node",
+      "args": [
+        "<path-to-repo>/claude-to-antigravity/server/index.mjs"
+      ],
+      "env": {
+        "AGENT_BRIDGE_ROLE": "peer",
+        "AGENT_BRIDGE_MAX_DEPTH": "1",
+        "AGENT_BRIDGE_ALLOW_CYCLES": "false",
+        "AGENT_BRIDGE_MAX_CONCURRENT": "4"
+      }
+    }
+  }
+}

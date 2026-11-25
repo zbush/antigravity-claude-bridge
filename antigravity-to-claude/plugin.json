@@ -1,0 +1,12 @@
+{
+  "name": "claude",
+  "displayName": "Local Claude Code Orchestrator",
+  "version": "1.1.0",
+  "logo": "assets/logo.svg",
+  "description": "Orchestrate local Claude Code agents via a bundled MCP server: run tasks, resume or fork sessions, perform read-only code reviews, and manage parallel background Claude Code workers with configurable hierarchy and recursion guards.",
+  "suggestedPrompts": [
+    "Ask local Claude Code to review my uncommitted git changes",
+    "Delegate a scoped implementation task to a local Claude Code agent in a git worktree",
+    "Spawn parallel local Claude Code agents to investigate two modules and summarize their findings"
+  ]
+}

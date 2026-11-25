@@ -1,0 +1,6 @@
+.DS_Store
+Thumbs.db
+*.log
+*.local.json
+mcp_config.local.json
+node_modules/

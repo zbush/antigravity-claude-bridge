@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "claude-local": {
+      "command": "node",
+      "args": [
+        "server/index.mjs"
+      ],
+      "env": {
+        "AGENT_BRIDGE_ROLE": "primary",
+        "AGENT_BRIDGE_MAX_DEPTH": "1",
+        "AGENT_BRIDGE_ALLOW_CYCLES": "false",
+        "AGENT_BRIDGE_MAX_CONCURRENT": "4",
+        "AGENT_BRIDGE_CALLBACK_DISALLOWED_TOOLS": "mcp__antigravity__*"
+      }
+    }
+  }
+}
