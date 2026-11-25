@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { realpathSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
@@ -39,11 +39,14 @@ async function connect(t, { missing = false, delayedExit = false, env: extraEnv 
         return;
       }
       const args = process.argv.slice(2);
-      const echoed = [...args, "env:" + (process.env.AGENT_BRIDGE_WORKSPACE_ROOTS ?? "")];
-      console.log(JSON.stringify({ type: "result", session_id: "${SESSION}", result: args[args.indexOf("--tools")+1] === "" ? input : JSON.stringify(echoed) }));
+      if (args[0] === "--version") return console.log("fixture version");
+      if (args[0] === "auth") return console.log(JSON.stringify({ loggedIn: true }));
+      const echoed = [...args, "edits:" + process.env.AGENT_BRIDGE_ALLOW_EDITS, "env:" + (process.env.AGENT_BRIDGE_WORKSPACE_ROOTS ?? "")];
+      console.log(JSON.stringify({ type: "result", session_id: input === "fixture-unique" ? require("node:crypto").randomUUID() : "${SESSION}", result: args[args.indexOf("--tools")+1] === "" ? input : JSON.stringify(echoed) }));
     });
   `);
   const env = { ...process.env, CLAUDE_CLI_BIN: cli };
+  delete env.CLAUDE_BIN;
   for (const key of Object.keys(env)) if (key.toUpperCase().startsWith("AGENT_BRIDGE_")) delete env[key];
   Object.assign(env, typeof extraEnv === "function" ? extraEnv(cwd) : extraEnv);
   const args = [server];
@@ -88,13 +91,14 @@ async function connect(t, { missing = false, delayedExit = false, env: extraEnv 
     requests.delete(reply.id);
   });
   const send = msg => child.stdin.write(JSON.stringify({ jsonrpc: "2.0", ...msg }) + "\n");
-  function call(name, args) {
+  function request(method, params) {
     const id = ++nextId;
     const reply = new Promise(resolve => requests.set(id, resolve));
-    send({ id, method: "tools/call", params: { name, arguments: { cwd, ...args } } });
+    send({ id, method, params });
     return reply;
   }
-  return { call, send, cwd };
+  const call = (name, args) => request("tools/call", { name, arguments: { cwd, ...args } });
+  return { call, request, send, cwd };
 }
 
 function payload(reply) {
@@ -110,10 +114,11 @@ test("the explicit marker and prompt both constrain a Claude launch", async t =>
   const marker = (id, role) => `[bridge: origin=claude role=${role} depth=1 max_depth=3 chain=claude:${id}]`;
   const args = { bridge_context: marker("one", "peer"), prompt: marker("one", "subordinate") + "\nReview the file." };
   const limited = await call("claude_run", args);
-  assert.equal(limited.result.isError, true);
-  assert.match(limited.result.content[0].text, /subordinate/);
+  assert.equal(limited.error.code, -32602);
+  assert.match(limited.error.data.reason, /subordinate/);
   const conflict = await call("claude_run", { ...args, prompt: marker("two", "peer") });
-  assert.match(conflict.error?.message ?? conflict.result?.content[0].text, /conflicting hop histories/);
+  assert.equal(conflict.error.code, -32602);
+  assert.match(conflict.error.data.reason, /conflicting hop histories/);
 });
 
 test("review runs a restricted Claude with only the requested read tools", async t => {
@@ -141,7 +146,17 @@ test("review runs a restricted Claude with only the requested read tools", async
 test("invalid explicit binary fails before launch", async t => {
   const { call } = await connect(t, { missing: true });
   const reply = await call("claude_run", { prompt: "fixture" });
-  assert.match(reply.error.message, /CLAUDE_CLI_BIN/);
+  assert.equal(reply.result.isError, true);
+  assert.match(reply.result.content[0].text, /CLAUDE_CLI_BIN/);
+  const status = await call("claude_status");
+  assert.equal(status.result.isError, true);
+  const details = payload(status);
+  assert.equal(details.binary, null);
+  assert.match(details.binary_error, /CLAUDE_CLI_BIN/);
+  assert.equal(details.version, null);
+  assert.equal(details.auth, null);
+  assert.ok(details.workspace && details.bridge);
+  assert.equal(details.active_jobs, 0);
 });
 
 test("a truncated stream or a final error without a newline fails the review", async t => {
@@ -159,7 +174,9 @@ test("unconfirmed cancellation retains its slot and reconciles a late exit", { t
   send({ method: "notifications/cancelled", params: { requestId: 1 } });
   const uncertain = payload(await waiting);
   assert.equal(uncertain.status, "termination_unconfirmed");
-  assert.ok((await call("claude_run", { prompt: "another" })).result.isError);
+  const blocked = await call("claude_run", { prompt: "another" });
+  assert.equal(blocked.error.code, -32602);
+  assert.match(blocked.error.data.reason, /concurrency/);
   await writeFile(path.join(cwd, "release"), "");
   let final;
   for (let i = 0; i < 100; i++) {
@@ -183,7 +200,22 @@ test("MCP cancellation waits for the fixture process to exit", { timeout: 12000 
   send({ method: "notifications/cancelled", params: { requestId: 1 } });
   const result = payload(await running);
   assert.ok(Number.isInteger(pid));
-  assert.equal(result.status, "cancelled", JSON.stringify(result.errors));
+  if (process.platform === "win32" && result.status === "failed") {
+    // Verify that the host itself denies taskkill before accepting the fallback.
+    const probe = spawn(process.execPath, ["-e", "setTimeout(() => {}, 5000)"], { windowsHide: true });
+    const exited = once(probe, "close");
+    await once(probe, "spawn");
+    const kill = spawnSync(path.join(process.env.SystemRoot, "System32", "taskkill.exe"),
+      ["/T", "/F", "/PID", String(probe.pid)], { windowsHide: true, encoding: "utf8" });
+    probe.kill();
+    await exited;
+    assert.notEqual(kill.status, 0);
+    assert.match(kill.stderr, /access.*denied/i);
+    assert.deepEqual(result.errors, ["Cancelled by caller.", "Windows could not confirm process-tree termination."]);
+    t.diagnostic("Windows denied tree termination. The bridge reported the failure and reaped the direct child.");
+  } else {
+    assert.equal(result.status, "cancelled", JSON.stringify(result.errors));
+  }
   assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
 });
 
@@ -240,7 +272,7 @@ test("invalid host configuration refuses launches but keeps status and cancellat
     assert.match((await call("claude_run", { prompt: "fixture" })).error.message, /Workspace policy is invalid/);
     assert.match((await call("claude_review", { review_diff: "d", allowed_tools: [] })).error.message, /Workspace policy is invalid/);
     assert.deepEqual(payload(await call("claude_job_status", {})), { jobs: [] });
-    assert.match((await call("claude_job_cancel", { job_id: "nope" })).result.content[0].text, /Unknown job_id/);
+    assert.match((await call("claude_job_cancel", { job_id: "nope" })).error.message, /Unknown job_id/);
   }
 });
 
@@ -300,11 +332,11 @@ test("the Antigravity callback is registered only for explicit peers below max d
   const args = argsOf(result);
   assert.ok(args.includes("--strict-mcp-config"));
   const config = JSON.parse(after(args, "--mcp-config"));
-  assert.deepEqual(Object.keys(config.mcpServers), ["antigravity"]);
-  assert.deepEqual(config.mcpServers.antigravity.args, [callbackServer]);
-  assert.equal(config.mcpServers.antigravity.env.AGENT_BRIDGE_WORKSPACE_ROOTS, JSON.stringify([realpathSync.native(peer.cwd)]));
-  assert.equal(config.mcpServers.antigravity.env.AGENT_BRIDGE_ROLE, "peer");
-  assert.equal(after(args, "--allowedTools"), "mcp__antigravity");
+  assert.deepEqual(Object.keys(config.mcpServers), ["antigravity-local"]);
+  assert.deepEqual(config.mcpServers["antigravity-local"].args, [callbackServer]);
+  assert.equal(config.mcpServers["antigravity-local"].env.AGENT_BRIDGE_WORKSPACE_ROOTS, JSON.stringify([realpathSync.native(peer.cwd)]));
+  assert.equal(config.mcpServers["antigravity-local"].env.AGENT_BRIDGE_ROLE, "peer");
+  assert.equal(after(args, "--allowedTools"), "mcp__antigravity-local");
   assert.equal(result.capabilities.callback_mcp, callbackServer);
   const review = argsOf(payload(await peer.call("claude_review", { review_diff: "d" })));
   assert.ok(!review.includes("--mcp-config"));
@@ -319,4 +351,112 @@ test("the Antigravity callback is registered only for explicit peers below max d
     assert.ok(!blocked.includes("--mcp-config"), JSON.stringify(env));
     assert.ok(!blocked.includes("--allowedTools"), JSON.stringify(env));
   }
+});
+
+test("spawned Claude and its peer callback inherit only the narrowed child workspace", async t => {
+  const { call, cwd } = await connect(t, { env: {
+    AGENT_BRIDGE_ALLOW_EDITS: "true", AGENT_BRIDGE_ROLE: "peer", AGENT_BRIDGE_MAX_DEPTH: "2",
+  } });
+  const sub = path.join(cwd, "sub");
+  const extra = path.join(cwd, "shared");
+  await mkdir(sub);
+  await mkdir(extra);
+  const args = argsOf(payload(await call("claude_run", {
+    cwd: sub, prompt: "fixture", allowed_tools: ["Read"], add_dirs: [extra],
+  })));
+  const roots = JSON.stringify([sub, extra].map(dir => realpathSync.native(dir)));
+  assert.ok(args.includes("env:" + roots));
+  assert.ok(args.includes("edits:false"));
+  const callback = JSON.parse(after(args, "--mcp-config")).mcpServers["antigravity-local"];
+  assert.equal(callback.env.AGENT_BRIDGE_WORKSPACE_ROOTS, roots);
+  assert.equal(callback.env.AGENT_BRIDGE_ALLOW_EDITS, "false");
+});
+
+test("body examples of bridge markers are ordinary prompt text", async t => {
+  const { call } = await connect(t);
+  const example = "[bridge: origin=claude role=subordinate ctx=invalid]";
+  for (const prompt of ["Task\n---\n" + example, "Example:\n" + example, "Task\n\nQuoted example follows\n" + example]) {
+    assert.equal(payload(await call("claude_run", { prompt })).status, "completed");
+  }
+  const header = await call("claude_run", { prompt: "[DELEGATED TASK: from Claude Code]\n" + example });
+  assert.equal(header.error.code, -32602);
+  assert.match(header.error.data.reason, /AGENT_BRIDGE_CONTEXT/);
+});
+
+test("review validates CLI options and review targets for direct and background calls", async t => {
+  const { call } = await connect(t);
+  for (const [key, value] of [
+    ["model", "--version"], ["effort", "lots"], ["title", ""], ["title", "  -title"],
+    ["base", " "], ["base", "--branch"], ["commit", 42], ["commit", "-x"],
+  ]) {
+    for (const name of ["claude_review", "claude_spawn"]) {
+      const args = name === "claude_spawn" ? { mode: "review" } : {};
+      const reply = await call(name, { ...args, [key]: value });
+      assert.equal(reply.error.code, -32602);
+      assert.ok(reply.error.message.includes(key));
+    }
+  }
+});
+
+test("all launch modes prepend delegation attribution once", async t => {
+  const { call } = await connect(t);
+  const header = "AGENT-TO-AGENT DELEGATION\nSending agent: Google Antigravity. Receiving agent: Claude Code.\nThis task was delegated by Google Antigravity on the user's behalf. The human may not have seen the sending conversation. Attribute relayed claims to Google Antigravity.";
+  for (const [name, extra] of [
+    ["claude_run", {}], ["claude_resume", { session_id: SESSION }], ["claude_fork", { session_id: SESSION }],
+    ["claude_review", { review_diff: "d" }],
+  ]) {
+    const custom = name === "claude_run" ? {} : { append_system_prompt: "Additional instruction." };
+    const args = argsOf(payload(await call(name, { prompt: "fixture", ...extra, ...custom })));
+    assert.equal(args.filter(arg => arg === "--append-system-prompt").length, 1);
+    assert.equal(after(args, "--append-system-prompt"), header + (custom.append_system_prompt ? "\n\n" + custom.append_system_prompt : ""));
+  }
+});
+
+test("independent depth, remaining hop budget and three-agent cycles also restrict tools/list", async t => {
+  const hops = [{ from: "claude", to: "codex", id: "one" }, { from: "codex", to: "antigravity", id: "two" }];
+  for (const env of [
+    { AGENT_BRIDGE_MAX_DEPTH: "0" },
+    { AGENT_BRIDGE_CONTEXT: JSON.stringify({ version: 1, hops: [], remaining_hops: 0 }) },
+    { AGENT_BRIDGE_CONTEXT: JSON.stringify({ version: 1, hops, remaining_hops: 3 }) },
+    { AGENT_BRIDGE_DEPTH: "2", AGENT_BRIDGE_CHAIN: "claude:one,codex:two" },
+  ]) {
+    const { call, request } = await connect(t, { env: {
+      AGENT_BRIDGE_ROLE: "independent", AGENT_BRIDGE_HIDE_RESTRICTED_TOOLS: "true", AGENT_BRIDGE_MAX_DEPTH: "5", ...env,
+    } });
+    const list = await request("tools/list");
+    assert.deepEqual(list.result.tools.map(tool => tool.name).sort(), ["claude_job_cancel", "claude_job_status", "claude_status"]);
+    const reply = await call("claude_run", { prompt: "hi" });
+    assert.equal(reply.error.code, -32602);
+    assert.match(reply.error.data.reason, /depth|cycle/);
+  }
+});
+
+test("CLAUDE_BIN takes priority over the legacy override, including when invalid", async t => {
+  const good = await connect(t, { env: cwd => ({
+    CLAUDE_BIN: path.join(cwd, "fixture.cjs"), CLAUDE_CLI_BIN: path.join(cwd, "missing.cjs"),
+  }) });
+  const status = payload(await good.call("claude_status"));
+  assert.equal(status.source, "CLAUDE_BIN");
+  assert.equal(status.version, "fixture version");
+  assert.deepEqual(status.auth, { loggedIn: true });
+  const bad = await connect(t, { env: { CLAUDE_BIN: "relative.cjs" } });
+  const reply = await bad.call("claude_status");
+  assert.equal(reply.result.isError, true);
+  assert.equal(payload(reply).binary, null);
+  assert.match(payload(reply).binary_error, /CLAUDE_BIN/);
+});
+
+test("old outputs are pruned while sessions and recent job results remain available", async t => {
+  const { call } = await connect(t);
+  const first = payload(await call("claude_run", { prompt: "fixture-unique" }));
+  let last;
+  for (let i = 0; i < 50; i++) last = payload(await call("claude_run", { prompt: "fixture" }));
+  const old = payload(await call("claude_job_status", { job_id: first.job_id }));
+  assert.equal(old.output_pruned, true);
+  assert.equal(old.response, undefined);
+  assert.deepEqual(old.capabilities, first.capabilities);
+  assert.equal(old.session_id, first.session_id);
+  const recent = payload(await call("claude_job_status", { job_id: last.job_id }));
+  assert.equal(recent.response, last.response);
+  assert.equal(payload(await call("claude_resume", { session_id: first.session_id, prompt: "again" })).status, "completed");
 });

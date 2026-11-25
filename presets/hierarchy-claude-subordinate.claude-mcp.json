@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "antigravity": {
+    "antigravity-local": {
       "command": "node",
       "args": [
         "<path-to-repo>/claude-to-antigravity/server/index.mjs"

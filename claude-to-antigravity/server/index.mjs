@@ -8,15 +8,16 @@
 // Delegation policy follows the shared AGENT_BRIDGE_* contract (see ../README.md).
 
 import { followupPolicy, nextContext, registeredContext } from './context.mjs';
-import { randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { spawnedState } from './spawned-state.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describeWorkspacePolicy, loadWorkspacePolicy, resolveWorkspaceDir } from './workspace-policy.mjs';
 
-const SERVER_NAME = 'antigravity';
-const SERVER_VERSION = '0.3.0';
+const SERVER_NAME = 'antigravity-local';
+const SERVER_VERSION = '1.2.0';
 const iconFile = new URL('../assets/icon-64.png', import.meta.url);
 const icons = fs.existsSync(iconFile) ? [{
   src: 'data:image/png;base64,' + fs.readFileSync(iconFile, 'base64'),
@@ -26,14 +27,13 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_CONFIG_FILE = path.join(HERE, '..', 'default-cascade-config.json');
 const AG_DIR = process.env.ANTIGRAVITY_DATA_DIR || path.join(os.homedir(), '.gemini', 'antigravity');
 const STATE_DIR = process.env.ANTIGRAVITY_MCP_STATE_DIR || path.join(os.homedir(), '.antigravity-mcp');
-const SPAWNED_FILE = path.join(STATE_DIR, 'spawned.json');
+const spawned = spawnedState(STATE_DIR);
 const SERVICE = 'exa.language_server_pb.LanguageServerService';
 const TAG = 'claude-mcp';
 // A conversation spawned this recently counts as active even if Antigravity still reports it idle.
 const SPAWN_GRACE_MS = 30000;
 
 const log = (...a) => process.stderr.write(`[claude-to-antigravity] ${a.join(' ')}\n`);
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const clip = (s, n) => (s && s.length > n ? s.slice(0, n) + `… [+${s.length - n} chars]` : s || '');
 
 // ---------------------------------------------------------------- bridge policy (AGENT_BRIDGE_*)
@@ -43,7 +43,10 @@ const DELEGATING_TOOLS = ['antigravity_spawn', 'antigravity_send'];
 const MUTATING_TOOLS = ['antigravity_spawn', 'antigravity_send', 'antigravity_cancel', 'antigravity_respond'];
 const READ_ONLY_TOOLS = ['antigravity_status', 'antigravity_wait', 'antigravity_result', 'antigravity_list', 'antigravity_models', 'antigravity_bridge_status'];
 
-class PolicyError extends Error {}
+class InvalidParams extends Error {}
+class PolicyError extends InvalidParams {
+  get data() { return { reason: this.message }; }
+}
 
 function loadBridgePolicy(env = process.env) {
   const errors = [];
@@ -113,8 +116,8 @@ function restrictions(p = BRIDGE) {
   if (p.depth >= p.maxDepth || p.context?.remaining_hops === 0) {
     add(DELEGATING_TOOLS, `delegation depth limit reached (AGENT_BRIDGE_DEPTH=${p.depth} >= AGENT_BRIDGE_MAX_DEPTH=${p.maxDepth})`);
   }
-  if (!p.allowCycles && p.chain.some(isAntigravityHop)) {
-    add(['antigravity_spawn'], `cycle prevented: AGENT_BRIDGE_CHAIN (${p.chain.join(',')}) already contains an antigravity hop, so delegating back to Antigravity would loop (set AGENT_BRIDGE_ALLOW_CYCLES=true to permit)`);
+  if (!p.allowCycles && (p.context?.hops.some(h => h.from === 'antigravity') ?? p.chain.some(isAntigravityHop))) {
+    add(DELEGATING_TOOLS, `cycle prevented: AGENT_BRIDGE_CHAIN (${p.chain.join(',')}) already contains an antigravity hop, so delegating back to Antigravity would loop (set AGENT_BRIDGE_ALLOW_CYCLES=true to permit)`);
   }
   return r;
 }
@@ -220,24 +223,33 @@ function discover() {
   return { base: `http://127.0.0.1:${hubs[0].httpPort}`, token: hubs[0].csrfToken };
 }
 
-async function rpc(method, body = {}, { timeoutMs = 60000, retry = true } = {}) {
+async function rpc(method, body = {}, { timeoutMs = 60000, retry = true, signal } = {}) {
+  signal?.throwIfAborted();
   if (!conn) conn = discover();
-  let res;
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  const timer = setTimeout(abort, timeoutMs);
+  signal?.addEventListener('abort', abort, { once: true });
+  let res, text;
   try {
     res = await fetch(`${conn.base}/${SERVICE}/${method}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'connect-protocol-version': '1', 'x-codeium-csrf-token': conn.token },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs),
+      signal: controller.signal,
     });
+    text = await res.text();
   } catch (e) {
+    signal?.throwIfAborted();
     // Antigravity may have restarted on a new port: rediscover once.
-    if (retry) { conn = null; return rpc(method, body, { timeoutMs, retry: false }); }
+    if (!res && retry) { conn = null; return rpc(method, body, { timeoutMs, retry: false, signal }); }
     throw new Error(`Could not reach Antigravity language server (${method}): ${e.message}`);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
   }
-  const text = await res.text();
   if (!res.ok) {
-    if ((res.status === 401 || res.status === 403) && retry) { conn = null; return rpc(method, body, { timeoutMs, retry: false }); }
+    if ((res.status === 401 || res.status === 403) && retry) { conn = null; return rpc(method, body, { timeoutMs, retry: false, signal }); }
     let msg = text;
     try { msg = JSON.parse(text).message || text; } catch {}
     throw new Error(`Antigravity ${method} failed (${res.status}): ${msg}`);
@@ -260,48 +272,37 @@ function fromFileUri(u) {
 }
 
 function checkConversationWorkspaces(info) {
-  if (!Array.isArray(info.workspaces) || !info.workspaces.length) throw new Error('The IDE did not report workspace roots for this conversation.');
-  for (const workspace of info.workspaces) {
-    resolveWorkspaceDir(WORKSPACE, fromFileUri(workspace.workspaceFolderAbsoluteUri), 'conversation workspace');
-  }
+  if (!Array.isArray(info?.workspaces) || !info.workspaces.length) throw new PolicyError('The IDE did not report workspace roots for this conversation.');
+  try {
+    for (const workspace of info.workspaces) {
+      resolveWorkspaceDir(WORKSPACE, fromFileUri(workspace?.workspaceFolderAbsoluteUri), 'conversation workspace');
+    }
+  } catch (error) { throw new PolicyError(error.message); }
 }
 
-function loadSpawned() {
-  try { return JSON.parse(fs.readFileSync(SPAWNED_FILE, 'utf8')); }
-  catch (error) {
-    if (error.code === 'ENOENT') return {};
-    throw new Error('Cannot read Antigravity bridge conversation state: ' + error.message);
-  }
-}
-function saveSpawned(id, info) {
-  const all = loadSpawned();
-  all[id] = { ...(all[id] || {}), ...info };
-  fs.mkdirSync(STATE_DIR, { recursive: true });
-  const temp = SPAWNED_FILE + '.' + randomUUID() + '.tmp';
-  try {
-    fs.writeFileSync(temp, JSON.stringify(all, null, 1), { flag: 'wx' });
-    fs.renameSync(temp, SPAWNED_FILE);
-  } finally {
-    fs.rmSync(temp, { force: true });
-  }
+function inWorkspace(info) {
+  try { checkConversationWorkspaces(info); return true; }
+  catch (error) { if (error instanceof PolicyError) return false; throw error; }
 }
 
 const shortStatus = (s) => (s || 'UNKNOWN').replace(/^CASCADE_RUN_STATUS_/, '').toLowerCase();
 const shortType = (t) => (t || '').replace(/^CORTEX_STEP_TYPE_/, '').toLowerCase();
 
-async function allSummaries() {
-  const r = await rpc('GetAllCascadeTrajectories', {});
+async function allSummaries(signal) {
+  const r = await rpc('GetAllCascadeTrajectories', {}, { signal });
   return r.trajectorySummaries || {};
 }
 
-async function summary(id) {
-  const s = (await allSummaries())[id];
-  if (!s) throw new Error(`No Antigravity conversation with id ${id}.`);
+async function summary(id, signal) {
+  const sums = await allSummaries(signal);
+  if (!Object.hasOwn(sums, id)) throw new InvalidParams(`No Antigravity conversation with id ${id}.`);
+  const s = sums[id];
+  checkConversationWorkspaces(s);
   return s;
 }
 
-async function stepsFrom(id, offset = 0) {
-  const r = await rpc('GetCascadeTrajectorySteps', { cascadeId: id, stepOffset: Math.max(0, offset) }, { timeoutMs: 120000 });
+async function stepsFrom(id, offset = 0, signal) {
+  const r = await rpc('GetCascadeTrajectorySteps', { cascadeId: id, stepOffset: Math.max(0, offset) }, { timeoutMs: 120000, signal });
   return r.steps || [];
 }
 
@@ -322,24 +323,17 @@ function isDone(s) {
 
 // Bridge-spawned conversations (by any process sharing this state dir) that are still active.
 async function activeSpawned() {
-  const mine = loadSpawned();
+  const mine = spawned.load();
   const sums = await allSummaries();
   const now = Date.now();
   return Object.entries(mine)
     .filter(([id, info]) => {
       const s = sums[id];
-      if (!s || s.annotations?.archived) return false;
+      if (!s) return now - Date.parse(info.created) < SPAWN_GRACE_MS;
+      if (s.annotations?.archived) return false;
       return !isDone(s) || now - Date.parse(info.created || 0) < SPAWN_GRACE_MS;
     })
     .map(([id]) => id);
-}
-
-// Serializes the concurrency check + StartCascade so parallel spawns can't overshoot the cap.
-let spawnQueue = Promise.resolve();
-function serialized(fn) {
-  const run = spawnQueue.then(fn, fn);
-  spawnQueue = run.catch(() => {});
-  return run;
 }
 
 function finalResponse(steps) {
@@ -413,7 +407,7 @@ async function resolveModel(q) {
   const n = q.toLowerCase();
   const hit = list.find((m) => [m.enum, m.model_id, m.label].some((v) => v && v.toLowerCase() === n))
     || list.find((m) => [m.model_id, m.label].some((v) => v && v.toLowerCase().includes(n)));
-  if (!hit) throw new Error(`Unknown model "${q}". Available: ${list.map((m) => `${m.label} (${m.model_id})`).join(', ')}`);
+  if (!hit) throw new InvalidParams(`Unknown model "${q}". Available: ${list.map((m) => `${m.label} (${m.model_id})`).join(', ')}`);
   return hit;
 }
 
@@ -421,10 +415,11 @@ async function resolveModel(q) {
 // own Antigravity conversations use, so spawned agents get identical tools/hooks/settings.
 async function baseConfig() {
   if (cachedConfig) return structuredClone(cachedConfig);
-  const mine = loadSpawned();
+  const mine = spawned.load();
   try {
     const sums = Object.entries(await allSummaries())
-      .filter(([id, s]) => !mine[id] && s.lastUserInputStepIndex !== undefined && s.trajectoryType === 'CORTEX_TRAJECTORY_TYPE_CASCADE')
+      .filter(([id, s]) => !Object.hasOwn(mine, id) && s.lastUserInputStepIndex !== undefined &&
+        s.trajectoryType === 'CORTEX_TRAJECTORY_TYPE_CASCADE' && inWorkspace(s))
       .sort((a, b) => String(b[1].lastUserInputTime || '').localeCompare(String(a[1].lastUserInputTime || '')));
     for (const [id, s] of sums.slice(0, 3)) {
       const steps = await stepsFrom(id, s.lastUserInputStepIndex);
@@ -449,17 +444,19 @@ async function buildConfig(modelQuery) {
 
 // ---------------------------------------------------------------- waiting
 
-async function waitFor(ids, { mode = 'all', timeoutSeconds = 600, baselines = {} } = {}) {
+async function waitFor(ids, { mode = 'all', timeoutSeconds = 600, baselines = {}, signal } = {}) {
   const started = Date.now();
   const deadline = started + Math.max(1, timeoutSeconds) * 1000;
-  const sawBusy = {};
-  const doneStreak = {};
+  const sawBusy = Object.create(null);
+  const doneStreak = Object.create(null);
   while (true) {
-    const sums = await allSummaries();
-    const state = {};
+    signal?.throwIfAborted();
+    const sums = await allSummaries(signal);
+    const state = Object.create(null);
     for (const id of ids) {
       const s = sums[id];
-      if (!s) { state[id] = 'missing'; continue; }
+      if (!Object.hasOwn(sums, id)) { state[id] = 'missing'; continue; }
+      checkConversationWorkspaces(s);
       const waiting = s.waitingSteps?.length > 0;
       if (!isDone(s)) sawBusy[id] = true;
       const progressed = sawBusy[id] || (s.stepCount || 0) > (baselines[id] ?? -1) + 1 || Date.now() - started > 20000;
@@ -470,13 +467,13 @@ async function waitFor(ids, { mode = 'all', timeoutSeconds = 600, baselines = {}
     const vals = Object.values(state);
     const finished = (v) => v === 'done' || v === 'missing' || v === 'needs_attention';
     if (mode === 'any' ? vals.some((v) => v === 'done' || v === 'needs_attention') : vals.every(finished)) return { state, timedOut: false };
-    if (Date.now() > deadline) return { state, timedOut: true };
-    await sleep(2500);
+    if (Date.now() >= deadline) return { state, timedOut: true };
+    await sleep(Math.min(2500, Math.max(0, deadline - Date.now())), undefined, { signal });
   }
 }
 
-async function report(id, { includeResponse = true, maxChars = 12000 } = {}) {
-  const s = await summary(id);
+async function report(id, { includeResponse = true, maxChars = 12000, signal } = {}) {
+  const s = await summary(id, signal);
   const out = {
     conversation_id: id,
     title: s.annotations?.title || s.summary || '',
@@ -497,7 +494,7 @@ async function report(id, { includeResponse = true, maxChars = 12000 } = {}) {
   }
   if (includeResponse) {
     const from = s.lastUserInputStepIndex ?? Math.max(0, (s.stepCount || 0) - 40);
-    out.final_response = clip(finalResponse(await stepsFrom(id, from)), maxChars) || (out.done ? '(no text response)' : '(still working)');
+    out.final_response = clip(finalResponse(await stepsFrom(id, from, signal)), maxChars) || (out.done ? '(no text response)' : '(still working)');
   }
   return out;
 }
@@ -525,8 +522,7 @@ const tools = {
       },
       required: ['prompt', 'cwd'],
     },
-    async run({ prompt, cwd, title, model, wait = false, timeout_seconds = 600, append_report_instructions = true }) {
-      if (!prompt || !cwd) throw new Error('prompt and cwd are required.');
+    async run({ prompt, cwd, title, model, wait = false, timeout_seconds = 600, append_report_instructions = true }, signal) {
       try {
         cwd = resolveWorkspaceDir(WORKSPACE, cwd, 'cwd');
       } catch (e) {
@@ -535,7 +531,7 @@ const tools = {
       const cascadeConfig = await buildConfig(model);
       const down = downstream();
       const shownTitle = delegatedTitle(title, prompt);
-      const cascadeId = await serialized(async () => {
+      const cascadeId = await spawned.withLock(async saveSpawned => {
         const active = await activeSpawned();
         if (active.length >= BRIDGE.maxConcurrent) {
           throw new PolicyError(refusal('antigravity_spawn',
@@ -551,13 +547,13 @@ const tools = {
         if (!id) throw new Error('Antigravity did not return a conversation id.');
         saveSpawned(id, { cwd, title: shownTitle, model: model || '', created: new Date().toISOString(), bridge: down });
         return id;
-      });
+      }, signal);
       await rpc('UpdateConversationAnnotations', { cascadeId, annotations: { title: shownTitle, tags: [TAG] }, mergeAnnotations: true }).catch((e) => log('title:', e.message));
       const text = delegationHeader(down) + prompt + (append_report_instructions ? REPORT_FOOTER : '');
       await rpc('SendUserCascadeMessage', { cascadeId, items: [{ text }], cascadeConfig });
       if (!wait) return { conversation_id: cascadeId, status: 'running', cwd, bridge: down, note: 'Poll with antigravity_wait or antigravity_status.' };
-      const w = await waitFor([cascadeId], { timeoutSeconds: timeout_seconds, baselines: { [cascadeId]: 0 } });
-      return { ...(await report(cascadeId)), timed_out: w.timedOut };
+      const w = await waitFor([cascadeId], { signal, timeoutSeconds: timeout_seconds, baselines: { [cascadeId]: 0 } });
+      return { ...(await report(cascadeId, { signal })), timed_out: w.timedOut };
     },
   },
 
@@ -574,20 +570,23 @@ const tools = {
       },
       required: ['conversation_id', 'message'],
     },
-    async run({ conversation_id, message, model, wait = false, timeout_seconds = 600 }) {
+    async run({ conversation_id, message, model, wait = false, timeout_seconds = 600 }, signal) {
       const before = await summary(conversation_id);
-      checkConversationWorkspaces(before);
       const cascadeConfig = await buildConfig(model);
       const current = downstream();
-      const original = loadSpawned()[conversation_id]?.bridge;
-      const down = original ? followupPolicy(current, original) : current;
-      if (original && (down.role !== original.role || down.maxDepth !== original.maxDepth)) {
-        saveSpawned(conversation_id, { bridge: down });
-      }
+      const down = await spawned.withLock(saveSpawned => {
+        const original = spawned.load()[conversation_id]?.bridge;
+        if (!original) return current;
+        let next;
+        try { next = followupPolicy(current, original); }
+        catch (error) { throw new PolicyError(error.message); }
+        if (next.role !== original.role || next.maxDepth !== original.maxDepth) saveSpawned(conversation_id, { bridge: next });
+        return next;
+      }, signal);
       await rpc('SendUserCascadeMessage', { cascadeId: conversation_id, items: [{ text: FOLLOWUP_HEADER + markerLine(down) + '\n\n' + message }], cascadeConfig });
       if (!wait) return { conversation_id, status: 'running', note: 'Message sent.' };
-      const w = await waitFor([conversation_id], { timeoutSeconds: timeout_seconds, baselines: { [conversation_id]: before.stepCount || 0 } });
-      return { ...(await report(conversation_id)), timed_out: w.timedOut };
+      const w = await waitFor([conversation_id], { signal, timeoutSeconds: timeout_seconds, baselines: { [conversation_id]: before.stepCount || 0 } });
+      return { ...(await report(conversation_id, { signal })), timed_out: w.timedOut };
     },
   },
 
@@ -605,14 +604,14 @@ const tools = {
       },
       required: ['conversation_ids'],
     },
-    async run({ conversation_ids, mode = 'all', timeout_seconds = 600, max_chars_per_response = 8000 }) {
-      if (!conversation_ids?.length) throw new Error('conversation_ids is empty.');
-      const w = await waitFor(conversation_ids, { mode, timeoutSeconds: timeout_seconds });
+    async run({ conversation_ids, mode = 'all', timeout_seconds = 600, max_chars_per_response = 8000 }, signal) {
+      if (!conversation_ids?.length) throw new InvalidParams('conversation_ids is empty.');
+      const w = await waitFor(conversation_ids, { signal, mode, timeoutSeconds: timeout_seconds });
       const results = [];
       for (const id of conversation_ids) {
         if (w.state[id] === 'missing') { results.push({ conversation_id: id, status: 'missing' }); continue; }
         const finished = w.state[id] === 'done' || w.state[id] === 'needs_attention';
-        results.push(await report(id, { includeResponse: finished, maxChars: max_chars_per_response }));
+        results.push(await report(id, { signal, includeResponse: finished, maxChars: max_chars_per_response }));
       }
       return { timed_out: w.timedOut, results };
     },
@@ -639,11 +638,11 @@ const tools = {
       required: ['conversation_id'],
     },
     async run({ conversation_id, detail = 'final', since_step, max_chars = 20000 }) {
+      const s = await summary(conversation_id);
       if (detail === 'markdown') {
         const r = await rpc('ConvertTrajectoryToMarkdown', { conversationId: conversation_id }, { timeoutMs: 120000 });
         return clip(r.markdown || '', max_chars);
       }
-      const s = await summary(conversation_id);
       const from = since_step ?? s.lastUserInputStepIndex ?? 0;
       const steps = await stepsFrom(conversation_id, from);
       if (detail === 'final') return clip(finalResponse(steps), max_chars) || `(no response yet; status ${shortStatus(s.status)})`;
@@ -658,14 +657,15 @@ const tools = {
       type: 'object',
       properties: {
         limit: { type: 'number', description: 'Default 20.' },
-        mine_only: { type: 'boolean', description: 'Only conversations spawned through this MCP. Default false.' },
+        mine_only: { type: 'boolean', description: 'Only conversations spawned through this MCP. Default true.' },
         include_archived: { type: 'boolean', description: 'Default false.' },
       },
     },
-    async run({ limit = 20, mine_only = false, include_archived = false }) {
-      const mine = loadSpawned();
+    async run({ limit = 20, mine_only = true, include_archived = false }) {
+      const mine = spawned.load();
       return Object.entries(await allSummaries())
-        .filter(([id, s]) => (!mine_only || mine[id]) && (include_archived || !s.annotations?.archived))
+        .filter(([id, s]) => (include_archived || !s.annotations?.archived) &&
+          (!mine_only || Object.hasOwn(mine, id)) && (WORKSPACE.errors.length ? Object.hasOwn(mine, id) : inWorkspace(s)))
         .sort((a, b) => String(b[1].lastModifiedTime || '').localeCompare(String(a[1].lastModifiedTime || '')))
         .slice(0, limit)
         .map(([id, s]) => ({
@@ -675,7 +675,7 @@ const tools = {
           needs_attention: (s.waitingSteps?.length || 0) > 0 || undefined,
           steps: s.stepCount,
           workspace: s.workspaces?.[0] ? fromFileUri(s.workspaces[0].workspaceFolderAbsoluteUri) : undefined,
-          spawned_by_mcp: !!mine[id] || undefined,
+          spawned_by_mcp: Object.hasOwn(mine, id) || undefined,
           last_modified: s.lastModifiedTime,
         }));
     },
@@ -689,6 +689,7 @@ const tools = {
       required: ['conversation_id'],
     },
     async run({ conversation_id, force_tree = false }) {
+      await summary(conversation_id);
       if (force_tree) await rpc('ForceStopCascadeTree', { conversationId: conversation_id });
       else await rpc('CancelCascadeInvocation', { cascadeId: conversation_id, killBackgroundTasks: true });
       await sleep(1000);
@@ -715,11 +716,10 @@ const tools = {
     async run({ conversation_id, allow, scope = 'once', deny_reason, step_index }) {
       const s = await summary(conversation_id);
       const waiting = s.waitingSteps || [];
-      checkConversationWorkspaces(s);
       const w = step_index === undefined ? waiting[0] : waiting.find((x) => (x.stepIndex ?? x.index) === step_index);
-      if (!w) throw new Error('That conversation is not waiting on any approval.');
+      if (!w) throw new InvalidParams('That conversation is not waiting on any approval.');
       const ri = w.step?.requestedInteraction || {};
-      if (!ri.permission) throw new Error(`The pending request is a "${Object.keys(ri)[0] || 'unknown'}" interaction; approve it in the Antigravity window.`);
+      if (!ri.permission) throw new PolicyError(`The pending request is a "${Object.keys(ri)[0] || 'unknown'}" interaction; approve it in the Antigravity window.`);
       const interaction = {
         trajectoryId: s.trajectoryId,
         stepIndex: w.stepIndex ?? w.index,
@@ -765,7 +765,7 @@ const tools = {
         config_errors: BRIDGE.errors.length ? BRIDGE.errors : undefined,
         workspace: {
           ...describeWorkspacePolicy(WORKSPACE),
-          note: 'Roots limit the cwd of new antigravity_spawn calls only. Agents use the IDE\'s own permissions; existing conversations are not limited.',
+          note: 'Workspace roots limit antigravity_spawn, antigravity_send, antigravity_respond, antigravity_cancel, antigravity_status, antigravity_result, antigravity_wait and antigravity_list. Agents use the IDE permissions.',
         },
       };
     },
@@ -788,6 +788,22 @@ function serverInstructions() {
   }
   return text;
 }
+
+function validateArguments(schema, args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) throw new InvalidParams('Tool arguments must be an object.');
+  for (const key of schema.required || []) {
+    if (!Object.hasOwn(args, key)) throw new InvalidParams(key + ' is required.');
+  }
+  for (const [key, field] of Object.entries(schema.properties)) {
+    if (!Object.hasOwn(args, key)) continue;
+    const value = args[key];
+    const valid = field.type === 'array' ? Array.isArray(value) && value.every(item => typeof item === 'string' && item.trim())
+      : typeof value === field.type && (field.type !== 'string' || value.trim()) && (field.type !== 'number' || Number.isFinite(value));
+    if (!valid || (field.enum && !field.enum.includes(value))) throw new InvalidParams('Invalid value for ' + key + '.');
+  }
+}
+
+const requests = new Map();
 
 async function handle(msg) {
   const { id, method, params } = msg;
@@ -813,21 +829,27 @@ async function handle(msg) {
         };
         break;
       }
+      case 'notifications/cancelled':
+        requests.get(params?.requestId)?.abort();
+        return;
       case 'tools/call': {
         const name = params?.name;
+        if (typeof name !== 'string' || !Object.hasOwn(tools, name)) throw new InvalidParams('Expected a registered tool name.');
         const t = tools[name];
-        if (!t) throw Object.assign(new Error(`Unknown tool: ${name}`), { code: -32602 });
         const blocked = restrictions()[name];
-        if (blocked) {
-          result = { content: [{ type: 'text', text: refusal(name, blocked) }], isError: true };
-          break;
-        }
+        if (blocked) throw new PolicyError(refusal(name, blocked));
+        const args = params.arguments === undefined ? {} : params.arguments;
+        validateArguments(t.inputSchema, args);
+        if (isRequest && requests.has(id)) throw Object.assign(new Error('Duplicate in-flight request ID.'), { code: -32600 });
+        const controller = new AbortController();
+        if (isRequest) requests.set(id, controller);
         try {
-          const out = await t.run(params.arguments || {});
+          const out = await t.run(args, controller.signal);
           result = { content: [{ type: 'text', text: typeof out === 'string' ? out : JSON.stringify(out, null, 1) }] };
         } catch (e) {
-          result = { content: [{ type: 'text', text: e instanceof PolicyError ? e.message : `Error: ${e.message}` }], isError: true };
-        }
+          if (e instanceof InvalidParams) throw e;
+          result = { content: [{ type: 'text', text: `Error: ${e.message}` }], isError: true };
+        } finally { if (isRequest) requests.delete(id); }
         break;
       }
       case 'resources/list': result = { resources: [] }; break;
@@ -838,7 +860,7 @@ async function handle(msg) {
     }
     if (isRequest) send({ jsonrpc: '2.0', id, result });
   } catch (e) {
-    if (isRequest) send({ jsonrpc: '2.0', id, error: { code: e.code || -32603, message: e.message } });
+    if (isRequest) send({ jsonrpc: '2.0', id, error: { code: e instanceof InvalidParams ? -32602 : e.code || -32603, message: e.message, data: e.data } });
   }
 }
 

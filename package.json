@@ -1,0 +1,13 @@
+{
+  "name": "antigravity-claude-bridge",
+  "version": "1.2.0",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  }
+}

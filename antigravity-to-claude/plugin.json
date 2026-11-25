@@ -1,12 +1,21 @@
 {
   "name": "claude",
-  "displayName": "Local Claude Code Orchestrator",
-  "version": "1.1.0",
+  "displayName": "Antigravity <-> Claude Bridge",
+  "version": "1.2.0",
   "logo": "assets/logo.png",
-  "description": "Orchestrate local Claude Code agents via a bundled MCP server: run tasks, resume or fork sessions, perform read-only code reviews, and manage parallel background Claude Code workers with configurable hierarchy and recursion guards.",
+  "author": {
+    "name": "zbush",
+    "url": "https://github.com/zbush"
+  },
+  "homepage": "https://github.com/zbush/antigravity-claude-bridge",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zbush/antigravity-claude-bridge"
+  },
+  "description": "Bidirectional zero-dependency MCP bridge between Google Antigravity and Anthropic Claude Code CLI with workspace ceilings, cycle/depth/concurrency guards, and parallel background workers.",
   "suggestedPrompts": [
+    "Check local Claude Code status and active bridge policy",
     "Ask local Claude Code to review my uncommitted git changes",
-    "Delegate a scoped implementation task to a local Claude Code agent in this workspace",
-    "Spawn parallel local Claude Code agents to investigate two modules and summarize their findings"
+    "Spawn parallel local Claude Code agents to inspect two modules and summarize their findings"
   ]
 }

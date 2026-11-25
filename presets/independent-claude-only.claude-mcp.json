@@ -1,13 +1,15 @@
 {
   "mcpServers": {
-    "antigravity": {
+    "antigravity-local": {
       "command": "node",
       "args": [
         "<path-to-repo>/claude-to-antigravity/server/index.mjs"
       ],
       "env": {
         "AGENT_BRIDGE_ROLE": "independent",
-        "AGENT_BRIDGE_MAX_CONCURRENT": "4"
+        "AGENT_BRIDGE_MAX_CONCURRENT": "4",
+        "AGENT_BRIDGE_ALLOW_EDITS": "true",
+        "AGENT_BRIDGE_WORKSPACE_ROOTS": "[\"/absolute/path/to/project\"]"
       }
     }
   }
