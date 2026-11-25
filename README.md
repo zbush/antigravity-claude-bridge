@@ -176,6 +176,8 @@ Use this when you want to start from **either** Antigravity or Claude Code and d
 
 ### Shared Bridge Environment Variables (Both Connectors)
 
+Both connectors accept `AGENT_BRIDGE_CONTEXT` from their host registration. The version 1 JSON envelope contains an ordered `hops` array of `{from, to, id}` objects and a nonnegative `remaining_hops` count. A child spends one hop and honors the tighter of the incoming and local limits. Older registrations using depth and a comma-separated sender history are translated when the history is complete. The IDE carries this context in its existing prompt marker. Its registration sets the limit even when the caller omits that marker.
+
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `AGENT_BRIDGE_ROLE` | `independent` | `independent`, `primary`, `subordinate`, or `peer`. |

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
+import { nextContext, readContext, registeredContext, senderHistory } from "./context.mjs";
 
 const SERVER_NAME = "claude-local";
 const SERVER_VERSION = "1.1.0";
@@ -88,10 +89,9 @@ function getBridgePolicy() {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
-  const badHop = chain.find((h) => !/^[^:,\s]+:[^,\s]+$/.test(h));
-  if (badHop) {
-    configErrors.push(`AGENT_BRIDGE_CHAIN hop "${badHop}" must look like <agent>:<id>`);
-  }
+  let context;
+  try { context = registeredContext(process.env, "antigravity", depth, chain, maxDepth); }
+  catch (error) { configErrors.push(error.message); }
   const allowCycles = parseBoolEnv("AGENT_BRIDGE_ALLOW_CYCLES", false, configErrors);
   const maxConcurrent = parseIntEnv("AGENT_BRIDGE_MAX_CONCURRENT", 4, 1, configErrors);
   const hideRestrictedTools = parseBoolEnv("AGENT_BRIDGE_HIDE_RESTRICTED_TOOLS", false, configErrors);
@@ -104,9 +104,10 @@ function getBridgePolicy() {
 
   return {
     role,
-    depth,
+    depth: context?.hops.length ?? depth,
     maxDepth,
-    chain,
+    chain: context?.hops.map(h => h.from + ":" + h.id) ?? chain,
+    context,
     allowCycles,
     maxConcurrent,
     hideRestrictedTools,
@@ -130,6 +131,7 @@ function parseInBandBridgeMarker(text, { requireLineStart = false } = {}) {
   }
   return {
     origin: fields.origin || null,
+    context: fields.ctx === undefined ? undefined : readContext(Buffer.from(fields.ctx, "base64url").toString("utf8"), "antigravity"),
     role: fields.role && VALID_BRIDGE_ROLES.has(fields.role) ? fields.role : null,
     depth: fields.depth !== undefined && /^\d+$/.test(fields.depth) ? Number(fields.depth) : null,
     maxDepth:
@@ -156,15 +158,20 @@ function evaluateDelegationPolicy(toolName, rawParams = {}) {
   if (inBand?.role === "subordinate") {
     effectiveRole = "subordinate";
   }
-  const effectiveDepth =
-    inBand && Number.isFinite(inBand.depth)
-      ? Math.max(policy.depth, inBand.depth)
-      : policy.depth;
-  const effectiveMaxDepth =
-    inBand && Number.isFinite(inBand.maxDepth)
-      ? Math.min(policy.maxDepth, inBand.maxDepth)
-      : policy.maxDepth;
-  const effectiveChain = Array.from(new Set([...policy.chain, ...(inBand?.chain || [])]));
+  let context = policy.context;
+  let effectiveMaxDepth = Math.min(policy.maxDepth, policy.depth + (context?.remaining_hops ?? 0));
+  if (inBand) {
+    effectiveMaxDepth = Math.min(effectiveMaxDepth, inBand.maxDepth ?? effectiveMaxDepth);
+    const marker = inBand.context ?? senderHistory(inBand.chain, "antigravity", Math.max(0, effectiveMaxDepth - inBand.chain.length));
+    if (inBand.depth !== null && marker.hops.length !== inBand.depth) throw new Error("Bridge marker depth disagrees with its history.");
+    if (context?.hops.some((hop, i) => JSON.stringify(hop) !== JSON.stringify(marker.hops[i]))) {
+      throw new Error("Bridge marker conflicts with the registered hop history.");
+    }
+    context = marker;
+    effectiveMaxDepth = Math.min(effectiveMaxDepth, marker.hops.length + marker.remaining_hops);
+  }
+  const effectiveDepth = context?.hops.length ?? policy.depth;
+  const effectiveChain = context?.hops.map(h => h.from + ":" + h.id) ?? policy.chain;
 
   if (!MUTATING_TOOLS.has(toolName)) {
     return { allowed: true, policy, effectiveRole, effectiveDepth, effectiveMaxDepth, effectiveChain };
@@ -189,7 +196,7 @@ function evaluateDelegationPolicy(toolName, rawParams = {}) {
     return { allowed: true, policy, effectiveRole, effectiveDepth, effectiveMaxDepth, effectiveChain };
   }
 
-  if (effectiveRole !== "independent" && effectiveDepth >= effectiveMaxDepth) {
+  if (effectiveDepth >= effectiveMaxDepth) {
     return {
       allowed: false,
       reason: `Delegation blocked by bridge policy: current depth (${effectiveDepth}) reached AGENT_BRIDGE_MAX_DEPTH (${effectiveMaxDepth}).`,
@@ -221,13 +228,15 @@ function evaluateDelegationPolicy(toolName, rawParams = {}) {
     effectiveDepth,
     effectiveMaxDepth,
     effectiveChain,
+    context,
   };
 }
 
 function buildDownstreamBridgeConfig(jobId, policyEval) {
-  const { policy, effectiveRole, effectiveDepth, effectiveMaxDepth, effectiveChain } = policyEval;
+  const { policy, effectiveRole, effectiveDepth, effectiveMaxDepth, effectiveChain, context } = policyEval;
   const nextDepth = effectiveDepth + 1;
   const nextChain = [...effectiveChain, `antigravity:${jobId}`];
+  const envelope = nextContext(context, "antigravity", "claude", effectiveMaxDepth - effectiveDepth, jobId);
 
   let downstreamRole = "independent";
   if (effectiveRole === "primary") {
@@ -242,6 +251,7 @@ function buildDownstreamBridgeConfig(jobId, policyEval) {
 
   return {
     env: {
+      AGENT_BRIDGE_CONTEXT: JSON.stringify(envelope),
       AGENT_BRIDGE_ROLE: downstreamRole,
       AGENT_BRIDGE_DEPTH: String(nextDepth),
       AGENT_BRIDGE_MAX_DEPTH: String(effectiveMaxDepth),
