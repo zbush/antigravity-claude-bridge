@@ -54,6 +54,26 @@ export function senderHistory(chain, actor, remaining) {
     hops: parsed.map((hop, i) => ({ ...hop, to: parsed[i + 1]?.from ?? actor })) }, actor);
 }
 
+// A follow-up continues the conversation's original handoff, including its hop ID.
+export function followupPolicy(current, saved) {
+  const prior = saved.context === undefined
+    ? senderHistory(saved.chain.split(","), "antigravity", Math.max(0, saved.maxDepth - saved.depth))
+    : validateContext(saved.context, "antigravity");
+  const depth = prior.hops.length;
+  if (!depth || prior.hops.at(-1).from !== "claude" || depth !== saved.depth || !Number.isSafeInteger(saved.maxDepth)) {
+    throw new Error("Invalid saved bridge policy for this Antigravity conversation.");
+  }
+  const caller = current.context.hops.slice(0, -1);
+  if (caller.length && JSON.stringify(caller) !== JSON.stringify(prior.hops.slice(0, -1))) {
+    throw new Error("This Antigravity conversation belongs to a different delegation history.");
+  }
+  const remaining = Math.max(0, Math.min(prior.remaining_hops, saved.maxDepth - depth, current.maxDepth - depth));
+  const role = !remaining || saved.role === "subordinate" || current.role === "subordinate" ? "subordinate"
+    : saved.role === "peer" || current.role === "peer" ? "peer" : current.role;
+  return { role, depth, maxDepth: depth + remaining, chain: prior.hops.map(h => h.from + ":" + h.id).join(","),
+    context: { ...prior, remaining_hops: remaining } };
+}
+
 export function registeredContext(env, actor, depth, chain, maximum) {
   const canonical = readContext(env.AGENT_BRIDGE_CONTEXT, actor);
   if (canonical) {

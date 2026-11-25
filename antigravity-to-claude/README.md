@@ -29,7 +29,22 @@ By default, the bridge collects a Git diff from `uncommitted`, `base`, or `commi
 }
 ```
 
-Diff-only reviews reject inputs over 120,000 characters. Split larger inputs into smaller patches. Normal `claude_run`, `claude_resume`, and `claude_fork` calls use their own permission settings.
+Diff-only reviews reject inputs over 120,000 characters. Split larger inputs into smaller patches.
+
+## Workspace and Tool Ceiling (`claude_run`, `claude_resume`, `claude_fork`, `claude_spawn`)
+
+The host operator sets the ceiling in the server's `env` block. Tool calls can narrow it but never widen it.
+
+| Variable | Default | Meaning |
+| :--- | :--- | :--- |
+| `AGENT_BRIDGE_WORKSPACE_ROOTS` | `[<server cwd>]` | JSON array of absolute, existing directories. If the server's cwd is a volume root (`C:\`, `/`), you must set this explicitly. |
+| `AGENT_BRIDGE_ALLOW_EDITS` | `false` | Exactly `true` or `false`. `true` adds `Edit` and `Write` to the tool ceiling. |
+
+- **Paths:** Before launch, the bridge resolves `cwd` and every `add_dirs` entry with `realpath`, so symlinks and junctions are followed. Each must land inside a root. Claude then gets the canonical paths. Reviews follow the same `cwd` rule.
+- **Launch flags:** Every launch passes `--restricted --strict-mcp-config --tools <set>`. The default set is `Read,Glob,Grep`, plus `Edit,Write` when edits are allowed. `allowed_tools` can choose a subset of that set. Shell tools, `bypassPermissions`/`auto` permission modes, `agent`, `worktree`/`worktree_name`, and `ide` are always rejected. User and project MCP servers never load.
+- **Resume and fork.** Pass the ID of a completed, persistent session that this server launched in the same canonical workspace. Its previous tools and additional directories must fit the current request. After a server restart, start a fresh session.
+- **Invalid configuration:** If either variable is invalid, the bridge refuses every launch, including reviews. `claude_status`, `claude_job_status`, and `claude_job_cancel` keep working, and `claude_status` reports the active `workspace` policy.
+- **Antigravity callback.** A peer with a hop left can load the companion `claude-to-antigravity/server/index.mjs` from the same installation. Its registration receives the selected workspace and additional directories. Starting IDE work also requires edit permission for the delegated Claude session. Copying only the Antigravity-to-Claude plugin installs a standalone Claude worker.
 
 ## Process Lifecycle, Timeouts, and Cancellation
 
@@ -40,7 +55,7 @@ The bridge holds the job's concurrency slot until it observes the Claude process
 ## Included Components
 
 - **MCP Server (`claude-local`)**: Exposes `claude_run`, `claude_resume`, `claude_fork`, `claude_review`, `claude_spawn`, `claude_job_status`, `claude_job_cancel`, and `claude_status`.
-- **Skill (`claude-orchestration`)**: Guides Antigravity on permission modes, `allowed_tools`, `--worktree` isolation, session reuse, and `[bridge: ...]` recursion guardrails.
+- **Skill (`claude-orchestration`)**: Guides Antigravity on the tool ceiling, `allowed_tools`, session reuse, and `[bridge: ...]` recursion guardrails.
 
 ## Installation
 
@@ -63,7 +78,7 @@ Copy-Item -Recurse -Force "<path-to-repo>\antigravity-to-claude" "$env:USERPROFI
 Run the Claude runner test suite from the repository root.
 
 ```bash
-node --test tests/claude-runner.test.mjs
+node --test tests/claude-runner.test.mjs tests/workspace-policy.test.mjs
 ```
 
 See the [root README](../README.md) for topology presets (independent, strict hierarchy, or bidirectional peer mode), `AGENT_BRIDGE_*` environment variables, and non-PATH Node.js configuration.

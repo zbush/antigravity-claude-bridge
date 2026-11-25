@@ -42,17 +42,12 @@ title or an in-band `[bridge: ...]` marker in the prompt):
 
 ## Orchestration Guidelines
 
-1. **Always pass an exact absolute `cwd`.** Never rely on implicit working directories.
-2. **Choose the narrowest `permission_mode` needed:**
-   - Use `permission_mode: "plan"` for codebase exploration, architecture audits, bug triage, and second opinions (strictly read-only).
-   - Use `permission_mode: "acceptEdits"` (default) for scoped file edits, paired with explicit `allowed_tools` (e.g. `["Read", "Edit", "Write", "Bash(npm test)", "Bash(git *)"]`) when Claude Code needs to run verification commands.
-   - Use `permission_mode: "auto"` when you want Claude Code's built-in auto-mode classifier to approve safe workspace edits and dev commands.
-   - Avoid `permission_mode: "bypassPermissions"` unless the user explicitly asks for it.
-   - Because headless runs pass `--permission-prompts none`, check `permission_denials` in the tool response if a command was blocked, and broaden `allowed_tools` or `permission_mode` only as needed.
-3. **Isolate parallel writers with `worktree: true`.** When spawning multiple Claude Code agents that edit files in the same Git repository at the same time, pass `worktree: true` (and optional `worktree_name`) so their edits do not collide on the working tree.
+1. **Always pass an exact absolute `cwd` inside the host's workspace roots.** The server rejects directories outside `AGENT_BRIDGE_WORKSPACE_ROOTS`. Check `claude_status` → `workspace` for the roots.
+2. **Work within the host tool ceiling.** Claude Code only gets `Read`, `Glob`, and `Grep`, plus `Edit` and `Write` when the host sets `AGENT_BRIDGE_ALLOW_EDITS=true`. It has no shell, so it cannot run tests or Git. Pass an `allowed_tools` subset to narrow further. `permission_mode` accepts `plan`, `acceptEdits`, or `dontAsk`. `agent`, `worktree`, and `ide` are rejected.
+3. **Avoid parallel writers on the same files.** Managed worktrees are not available, so give each concurrent editing agent separate files or directories.
 4. **Write self-contained briefs.** Claude Code runs in its own fresh context and does not see this conversation. Include:
    - Concrete goal and scope (exact files/modules to inspect or change)
    - Constraints and conventions to follow
-   - Verification criteria (tests/checks Claude Code should run) and expected output summary
-5. **Leverage `session_id` for multi-turn loops.** Save the `session_id` returned by `claude_run` or `claude_job_status` so you can follow up with `claude_resume` or branch with `claude_fork` instead of repeating full context.
+   - Expected output summary. Run any tests yourself, because Claude Code has no shell.
+5. **Leverage `session_id` for multi-turn loops.** Save the `session_id` returned by `claude_run` or `claude_job_status`. You can resume (after the run finishes) or fork it with the same `cwd` while this server process is running.
 6. **Verify before handing back.** After Claude Code modifies files, inspect the git diff or run tests yourself before reporting completion to the user.

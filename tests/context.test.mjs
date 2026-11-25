@@ -25,3 +25,18 @@ test("legacy conversion preserves sender IDs and invalid authority fails closed 
     assert.throws(() => decode(JSON.stringify(legacy), "codex"), /last hop/);
   }
 });
+
+test("IDE follow-ups preserve the original handoff and honor subsequent reductions", () => {
+  const saved = { role: "peer", depth: 2, maxDepth: 5, chain: "codex:one,claude:two" };
+  const current = { role: "independent", maxDepth: 3, context: ide.senderHistory(["claude:new"], "antigravity", 2) };
+  const followup = ide.followupPolicy(current, saved);
+  assert.equal(followup.role, "peer");
+  assert.equal(followup.chain, saved.chain);
+  assert.equal(followup.context.remaining_hops, 1);
+  const tighter = ide.followupPolicy({ ...current, maxDepth: 1 }, followup);
+  assert.equal(tighter.context.remaining_hops, 0);
+  assert.equal(ide.followupPolicy(current, tighter).role, "subordinate");
+  const sameCaller = { ...current, context: ide.senderHistory(["codex:one", "claude:next"], "antigravity", 1) };
+  assert.deepEqual(ide.followupPolicy(sameCaller, followup), followup);
+  assert.throws(() => ide.followupPolicy({ ...current, context: ide.senderHistory(["codex:other", "claude:new"], "antigravity", 2) }, saved), /different delegation history/);
+});
