@@ -1,9 +1,18 @@
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
+import { nextContext, readContext, registeredContext, senderHistory } from "./context.mjs";
+import { fileURLToPath } from "node:url";
+import {
+  EDITS_ENV,
+  ROOTS_ENV,
+  describeWorkspacePolicy,
+  loadWorkspacePolicy,
+  resolveWorkspaceDir,
+} from "./workspace-policy.mjs";
 
 const SERVER_NAME = "claude-local";
 const SERVER_VERSION = "1.1.0";
@@ -24,8 +33,29 @@ const SPAWN_DELEGATING_TOOLS = new Set([
 ]);
 const MUTATING_TOOLS = new Set([...SPAWN_DELEGATING_TOOLS, "claude_job_cancel"]);
 
+// Capability ceiling for ordinary (run/resume/fork) launches.
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const LAUNCH_MODES = ["run", "resume", "fork", "review"];
+const READ_TOOLS = ["Read", "Glob", "Grep"];
+const EDIT_TOOLS = ["Edit", "Write"];
+const ORDINARY_PERMISSION_MODES = ["plan", "acceptEdits", "dontAsk"];
+const ORDINARY_PARAMS = new Set([
+  "mode", "prompt", "cwd", "session_id", "last", "permission_mode", "model", "effort", "add_dirs",
+  "allowed_tools", "disallowed_tools", "append_system_prompt", "max_budget_usd", "ephemeral",
+  "bridge_context", "timeout_seconds",
+]);
+const ESCAPING_PARAMS = {
+  agent: "custom agents load project or user definitions that can grant extra tools",
+  worktree: "managed worktrees run worktree hooks and create directories outside the validated cwd",
+  worktree_name: "managed worktrees run worktree hooks and create directories outside the validated cwd",
+  ide: "IDE connections add MCP tools outside the granted tool set",
+};
+const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const CALLBACK_SERVER_NAME = "antigravity";
+
 const jobs = new Map();
 const activeChildren = new Set();
+const requestControllers = new Map();
 
 function log(message) {
   process.stderr.write(`[${SERVER_NAME}] ${message}\n`);
@@ -87,10 +117,9 @@ function getBridgePolicy() {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
-  const badHop = chain.find((h) => !/^[^:,\s]+:[^,\s]+$/.test(h));
-  if (badHop) {
-    configErrors.push(`AGENT_BRIDGE_CHAIN hop "${badHop}" must look like <agent>:<id>`);
-  }
+  let context;
+  try { context = registeredContext(process.env, "antigravity", depth, chain, maxDepth); }
+  catch (error) { configErrors.push(error.message); }
   const allowCycles = parseBoolEnv("AGENT_BRIDGE_ALLOW_CYCLES", false, configErrors);
   const maxConcurrent = parseIntEnv("AGENT_BRIDGE_MAX_CONCURRENT", 4, 1, configErrors);
   const hideRestrictedTools = parseBoolEnv("AGENT_BRIDGE_HIDE_RESTRICTED_TOOLS", false, configErrors);
@@ -103,9 +132,10 @@ function getBridgePolicy() {
 
   return {
     role,
-    depth,
+    depth: context?.hops.length ?? depth,
     maxDepth,
-    chain,
+    chain: context?.hops.map(h => h.from + ":" + h.id) ?? chain,
+    context,
     allowCycles,
     maxConcurrent,
     hideRestrictedTools,
@@ -129,6 +159,7 @@ function parseInBandBridgeMarker(text, { requireLineStart = false } = {}) {
   }
   return {
     origin: fields.origin || null,
+    context: fields.ctx === undefined ? undefined : readContext(Buffer.from(fields.ctx, "base64url").toString("utf8"), "antigravity"),
     role: fields.role && VALID_BRIDGE_ROLES.has(fields.role) ? fields.role : null,
     depth: fields.depth !== undefined && /^\d+$/.test(fields.depth) ? Number(fields.depth) : null,
     maxDepth:
@@ -146,24 +177,30 @@ function parseInBandBridgeMarker(text, { requireLineStart = false } = {}) {
 
 function evaluateDelegationPolicy(toolName, rawParams = {}) {
   const policy = getBridgePolicy();
-  const inBand =
-    parseInBandBridgeMarker(rawParams.bridge_context, { requireLineStart: false }) ||
-    parseInBandBridgeMarker(rawParams.prompt, { requireLineStart: true });
+  const markers = [
+    parseInBandBridgeMarker(rawParams.bridge_context),
+    parseInBandBridgeMarker(rawParams.prompt, { requireLineStart: true }),
+  ].filter(Boolean);
 
-  // Merge in-band marker (from Claude -> Antigravity RPC messages) with local env policy.
   let effectiveRole = policy.role;
-  if (inBand?.role === "subordinate") {
-    effectiveRole = "subordinate";
+  let context = policy.context;
+  let effectiveMaxDepth = Math.min(policy.maxDepth, policy.depth + (context?.remaining_hops ?? 0));
+  for (const inBand of markers) {
+    if (inBand.role === "subordinate") effectiveRole = "subordinate";
+    effectiveMaxDepth = Math.min(effectiveMaxDepth, inBand.maxDepth ?? effectiveMaxDepth);
+    const marker = inBand.context ?? senderHistory(inBand.chain, "antigravity", Math.max(0, effectiveMaxDepth - inBand.chain.length));
+    if (inBand.depth !== null && marker.hops.length !== inBand.depth) throw new Error("Bridge marker depth disagrees with its history.");
+    if (policy.context?.hops.some((hop, i) => JSON.stringify(hop) !== JSON.stringify(marker.hops[i]))) {
+      throw new Error("Bridge marker conflicts with the registered hop history.");
+    }
+    if (context && marker.hops.slice(0, context.hops.length).some((hop, i) => JSON.stringify(hop) !== JSON.stringify(context.hops[i]))) {
+      throw new Error("Bridge markers contain conflicting hop histories.");
+    }
+    if (!context || marker.hops.length >= context.hops.length) context = marker;
+    effectiveMaxDepth = Math.min(effectiveMaxDepth, marker.hops.length + marker.remaining_hops);
   }
-  const effectiveDepth =
-    inBand && Number.isFinite(inBand.depth)
-      ? Math.max(policy.depth, inBand.depth)
-      : policy.depth;
-  const effectiveMaxDepth =
-    inBand && Number.isFinite(inBand.maxDepth)
-      ? Math.min(policy.maxDepth, inBand.maxDepth)
-      : policy.maxDepth;
-  const effectiveChain = Array.from(new Set([...policy.chain, ...(inBand?.chain || [])]));
+  const effectiveDepth = context?.hops.length ?? policy.depth;
+  const effectiveChain = context?.hops.map(h => h.from + ":" + h.id) ?? policy.chain;
 
   if (!MUTATING_TOOLS.has(toolName)) {
     return { allowed: true, policy, effectiveRole, effectiveDepth, effectiveMaxDepth, effectiveChain };
@@ -188,7 +225,7 @@ function evaluateDelegationPolicy(toolName, rawParams = {}) {
     return { allowed: true, policy, effectiveRole, effectiveDepth, effectiveMaxDepth, effectiveChain };
   }
 
-  if (effectiveRole !== "independent" && effectiveDepth >= effectiveMaxDepth) {
+  if (effectiveDepth >= effectiveMaxDepth) {
     return {
       allowed: false,
       reason: `Delegation blocked by bridge policy: current depth (${effectiveDepth}) reached AGENT_BRIDGE_MAX_DEPTH (${effectiveMaxDepth}).`,
@@ -205,7 +242,7 @@ function evaluateDelegationPolicy(toolName, rawParams = {}) {
     };
   }
 
-  const runningCount = Array.from(jobs.values()).filter((j) => j.status === "running").length;
+  const runningCount = activeChildren.size;
   if (runningCount >= policy.maxConcurrent) {
     return {
       allowed: false,
@@ -220,13 +257,15 @@ function evaluateDelegationPolicy(toolName, rawParams = {}) {
     effectiveDepth,
     effectiveMaxDepth,
     effectiveChain,
+    context,
   };
 }
 
 function buildDownstreamBridgeConfig(jobId, policyEval) {
-  const { policy, effectiveRole, effectiveDepth, effectiveMaxDepth, effectiveChain } = policyEval;
+  const { policy, effectiveRole, effectiveDepth, effectiveMaxDepth, effectiveChain, context } = policyEval;
   const nextDepth = effectiveDepth + 1;
   const nextChain = [...effectiveChain, `antigravity:${jobId}`];
+  const envelope = nextContext(context, "antigravity", "claude", effectiveMaxDepth - effectiveDepth, jobId);
 
   let downstreamRole = "independent";
   if (effectiveRole === "primary") {
@@ -241,6 +280,7 @@ function buildDownstreamBridgeConfig(jobId, policyEval) {
 
   return {
     env: {
+      AGENT_BRIDGE_CONTEXT: JSON.stringify(envelope),
       AGENT_BRIDGE_ROLE: downstreamRole,
       AGENT_BRIDGE_DEPTH: String(nextDepth),
       AGENT_BRIDGE_MAX_DEPTH: String(effectiveMaxDepth),
@@ -332,7 +372,7 @@ function findClaudeInExtensionsDir(extDir, binaryName) {
 
 function findOnPath(binaryNames) {
   const pathEnv = process.env.PATH || "";
-  const dirs = pathEnv.split(path.delimiter).filter(Boolean);
+  const dirs = pathEnv.split(path.delimiter).map(dir => dir.replace(/^"|"$/g, "")).filter(dir => path.isAbsolute(dir));
   for (const dir of dirs) {
     for (const name of binaryNames) {
       const full = path.join(dir, name);
@@ -355,7 +395,13 @@ function discoverClaudeBinary() {
 
   // 1. Explicit env override
   const configured = process.env.CLAUDE_CLI_BIN;
-  if (configured && fs.existsSync(configured)) {
+  if (configured) {
+    if (!path.isAbsolute(configured) || !fs.statSync(configured, { throwIfNoEntry: false })?.isFile()) {
+      throw new Error("CLAUDE_CLI_BIN must point to an existing absolute file.");
+    }
+    if (isWin && !/\.(exe|[cm]?js)$/i.test(configured)) {
+      throw new Error("CLAUDE_CLI_BIN must point to a Windows .exe or JavaScript CLI entry point.");
+    }
     return { path: configured, source: "CLAUDE_CLI_BIN" };
   }
 
@@ -370,7 +416,7 @@ function discoverClaudeBinary() {
     }
   }
 
-  const fromPath = findOnPath(isWin ? ["claude.exe", "claude.cmd"] : ["claude"]);
+  const fromPath = findOnPath(isWin ? ["claude.exe", path.join("node_modules", "@anthropic-ai", "claude-code", "cli.js")] : ["claude"]);
   if (fromPath) {
     return { path: fromPath, source: "PATH" };
   }
@@ -443,41 +489,14 @@ function discoverClaudeBinary() {
 
 function resolveClaudeInvocation(claudeArgs) {
   const discovered = discoverClaudeBinary();
-  if (discovered) {
-    if (process.platform === "win32" && discovered.path.toLowerCase().endsWith(".cmd")) {
-      return {
-        command: "cmd.exe",
-        args: ["/d", "/s", "/c", discovered.path, ...claudeArgs],
-        shell: false,
-        binary: discovered.path,
-        source: discovered.source,
-      };
-    }
-    return {
-      command: discovered.path,
-      args: claudeArgs,
-      shell: false,
-      binary: discovered.path,
-      source: discovered.source,
-    };
-  }
-
-  if (process.platform === "win32") {
-    return {
-      command: "cmd.exe",
-      args: ["/d", "/s", "/c", "claude", ...claudeArgs],
-      shell: false,
-      binary: "claude",
-      source: "fallback-path",
-    };
-  }
-
+  if (!discovered) throw new Error("Cannot find Claude Code. Set CLAUDE_CLI_BIN to its absolute executable path.");
+  const useNode = /\.[cm]?js$/i.test(discovered.path);
   return {
-    command: "claude",
-    args: claudeArgs,
+    command: useNode ? process.execPath : discovered.path,
+    args: useNode ? [discovered.path, ...claudeArgs] : claudeArgs,
     shell: false,
-    binary: "claude",
-    source: "fallback-path",
+    binary: discovered.path,
+    source: discovered.source,
   };
 }
 
@@ -497,20 +516,114 @@ function clampTimeoutMs(timeoutSeconds) {
   return seconds * 1000;
 }
 
-function validateCwd(cwd) {
-  if (typeof cwd !== "string" || !cwd.trim()) {
-    throw new Error("'cwd' must be a non-empty absolute directory path.");
+function isStringArray(value) {
+  return Array.isArray(value) && value.every((v) => typeof v === "string");
+}
+
+function validateOrdinaryParams(mode, params) {
+  for (const key of Object.keys(params)) {
+    if (Object.hasOwn(ESCAPING_PARAMS, key)) {
+      throw new Error(`'${key}' is not available for ordinary Claude launches: ${ESCAPING_PARAMS[key]}.`);
+    }
+    if (!ORDINARY_PARAMS.has(key)) throw new Error(`Unsupported ${mode} parameter: ${key}`);
   }
-  const resolved = path.resolve(cwd);
-  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
-    throw new Error(`Directory does not exist: ${resolved}`);
+  if (mode === "run" && params.session_id !== undefined) {
+    throw new Error("'session_id' applies only to resume and fork.");
   }
-  return resolved;
+  if (params.permission_mode !== undefined && !ORDINARY_PERMISSION_MODES.includes(params.permission_mode)) {
+    throw new Error(`permission_mode must be one of ${ORDINARY_PERMISSION_MODES.join(", ")}; permission bypass and auto-approval are not available.`);
+  }
+  if (params.model !== undefined && (typeof params.model !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:@/[\]-]*$/.test(params.model))) {
+    throw new Error("model must be a model alias or name.");
+  }
+  if (params.effort !== undefined && !EFFORT_SCHEMA.enum.includes(params.effort)) {
+    throw new Error(`effort must be one of ${EFFORT_SCHEMA.enum.join(", ")}.`);
+  }
+  for (const key of ["add_dirs", "allowed_tools", "disallowed_tools"]) {
+    if (params[key] !== undefined && !isStringArray(params[key])) throw new Error(`${key} must be a string array.`);
+  }
+  if (params.append_system_prompt !== undefined && typeof params.append_system_prompt !== "string") {
+    throw new Error("append_system_prompt must be a string.");
+  }
+}
+
+// Built-in tools for an ordinary launch: the host ceiling, optionally narrowed by the caller.
+function resolveOrdinaryTools(params, workspace) {
+  const ceiling = workspace.allowEdits ? [...READ_TOOLS, ...EDIT_TOOLS] : READ_TOOLS;
+  if (params.allowed_tools === undefined) return ceiling;
+  const unknown = params.allowed_tools.filter((t) => !ceiling.includes(t));
+  if (unknown.length) {
+    throw new Error(
+      `allowed_tools may only narrow the host ceiling (${ceiling.join(", ")}); refused: ${unknown.join(", ")}.` +
+        (workspace.allowEdits ? "" : ` Edit and Write require ${EDITS_ENV}=true on the host.`)
+    );
+  }
+  return ceiling.filter((t) => params.allowed_tools.includes(t));
+}
+
+// Resume and fork only reuse sessions this bridge process launched in the same canonical cwd,
+// so a restricted run cannot continue an unrestricted session or one rooted elsewhere.
+function checkSessionReuse(mode, params, cwd, addDirs, tools) {
+  if (params.last !== undefined && params.last !== false) {
+    throw new Error("'last' (--continue) is not available: it selects an arbitrary session. Pass the session_id returned by a bridge run.");
+  }
+  const sessionId = params.session_id;
+  if (typeof sessionId !== "string" || !SESSION_ID_PATTERN.test(sessionId)) {
+    throw new Error(`claude_${mode} requires a session_id UUID returned by a bridge run.`);
+  }
+  const owners = Array.from(jobs.values()).filter((job) => job.session_id === sessionId);
+  if (owners.length === 0) {
+    throw new Error(`Session ${sessionId} was not started by this bridge process. Only bridge-launched sessions can be resumed or forked.`);
+  }
+  if (!owners.some((job) => job.cwd === cwd)) {
+    throw new Error(`Session ${sessionId} belongs to a different cwd (${owners[0].cwd}).`);
+  }
+  if (owners.some(job => job.status === "running" || job.status === "termination_unconfirmed")) {
+    throw new Error(`Session ${sessionId} is still running. Wait for its exit before reusing it.`);
+  }
+  if (!owners.some(job => job.cwd === cwd && job.status === "completed" && !job.ephemeral) ||
+      owners.some(job => job.capabilities.add_dirs.some(dir => dir !== cwd && !addDirs.includes(dir)) ||
+        job.capabilities.tools.some(tool => !tools.includes(tool)))) {
+    throw new Error("The saved session is unavailable or had broader permissions. Start a fresh run with this scope.");
+  }
+}
+
+function resolveCallbackServer() {
+  const candidate = path.join(HERE, "..", "..", "claude-to-antigravity", "server", "index.mjs");
+  try {
+    const real = fs.realpathSync.native(candidate);
+    return fs.statSync(real).isFile() ? real : null;
+  } catch {
+    return null;
+  }
+}
+
+// The reciprocal Claude -> Antigravity callback is registered only in explicit peer mode while the
+// downstream hop may still delegate, and only from the claude-to-antigravity server shipped in this
+// same installation. User and project MCP servers are never loaded (--strict-mcp-config).
+function buildCallbackMcpConfig(policyEval, downstream, workspace) {
+  if (policyEval.policy?.role !== "peer" || downstream.downstreamRole !== "peer") return null;
+  if (downstream.extraDisallowedTools.length > 0) return null;
+  const server = resolveCallbackServer();
+  if (!server) return null;
+  const env = {
+    ...downstream.env,
+    [ROOTS_ENV]: JSON.stringify(workspace.roots),
+    [EDITS_ENV]: String(workspace.allowEdits),
+  };
+  return {
+    server,
+    config: JSON.stringify({
+      mcpServers: { [CALLBACK_SERVER_NAME]: { type: "stdio", command: process.execPath, args: [server], env } },
+    }),
+  };
 }
 
 function runGitSafe(cwd, gitArgs) {
   try {
-    return execFileSync("git", gitArgs, {
+    const git = findOnPath([process.platform === "win32" ? "git.exe" : "git"]);
+    if (!git) throw new Error("Cannot find Git on PATH.");
+    return execFileSync(git, ["--no-optional-locks", "-c", "core.fsmonitor=false", ...gitArgs], {
       cwd,
       encoding: "utf8",
       maxBuffer: 10 * 1024 * 1024,
@@ -525,6 +638,7 @@ function runGitSafe(cwd, gitArgs) {
 
 function buildReviewPrompt(cwd, params) {
   const sections = [];
+  const diffOnly = params.allowed_tools?.length === 0;
   if (params.title) {
     sections.push(`# Review Title: ${String(params.title).trim()}`);
   }
@@ -534,20 +648,25 @@ function buildReviewPrompt(cwd, params) {
   let gitContextError = null;
 
   try {
-    if (params.commit) {
+    if (params.review_diff !== undefined) {
+      targetDescription = "the supplied diff";
+      diffContent = params.review_diff;
+    } else if (params.commit) {
       const sha = String(params.commit).trim();
       targetDescription = `commit ${sha}`;
-      diffContent = runGitSafe(cwd, ["show", "--stat", "--patch", sha]);
+      const commit = runGitSafe(cwd, ["rev-parse", "--verify", "--end-of-options", sha + "^{commit}"]).trim();
+      diffContent = runGitSafe(cwd, ["show", "--no-ext-diff", "--no-textconv", "--stat", "--patch", commit, "--"]);
     } else if (params.base) {
       const base = String(params.base).trim();
       targetDescription = `branch diff against '${base}' (${base}...HEAD)`;
-      const stat = runGitSafe(cwd, ["diff", "--stat", `${base}...HEAD`]);
-      const patch = runGitSafe(cwd, ["diff", `${base}...HEAD`]);
+      const commit = runGitSafe(cwd, ["rev-parse", "--verify", "--end-of-options", base + "^{commit}"]).trim();
+      const stat = runGitSafe(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--stat", `${commit}...HEAD`, "--"]);
+      const patch = runGitSafe(cwd, ["diff", "--no-ext-diff", "--no-textconv", `${commit}...HEAD`, "--"]);
       diffContent = `${stat}\n${patch}`.trim();
     } else {
       const status = runGitSafe(cwd, ["status", "--short"]);
-      const staged = runGitSafe(cwd, ["diff", "--cached"]);
-      const unstaged = runGitSafe(cwd, ["diff"]);
+      const staged = runGitSafe(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--cached"]);
+      const unstaged = runGitSafe(cwd, ["diff", "--no-ext-diff", "--no-textconv"]);
       const parts = [];
       if (status.trim()) parts.push(`## git status --short\n${status.trim()}`);
       if (staged.trim()) parts.push(`## Staged diff (git diff --cached)\n${staged.trim()}`);
@@ -555,7 +674,11 @@ function buildReviewPrompt(cwd, params) {
       diffContent = parts.join("\n\n");
     }
   } catch (err) {
+    if (diffOnly) throw new Error("Cannot prepare the diff for a diff-only review: " + err.message);
     gitContextError = err instanceof Error ? err.message : String(err);
+  }
+  if (diffOnly && diffContent.length > MAX_REVIEW_DIFF_CHARS) {
+    throw new Error("Diff-only review accepts at most " + MAX_REVIEW_DIFF_CHARS + " characters. Split the diff and review each part.");
   }
 
   sections.push(
@@ -563,7 +686,7 @@ function buildReviewPrompt(cwd, params) {
       `Perform a thorough, read-only code review of ${targetDescription} in ${cwd}.`,
       "Focus on correctness bugs, regressions, security issues, edge cases, race conditions, missing error handling, and test coverage gaps.",
       "Cite exact file paths and line numbers for each finding, ordered by severity (Critical / High / Medium / Low).",
-      "Do NOT modify any files. You may read surrounding files in the repository for context.",
+      diffOnly ? "Base the review on the supplied diff alone." : "You may read surrounding files in the repository for context. Do not modify files.",
     ].join("\n")
   );
 
@@ -588,39 +711,19 @@ function buildReviewPrompt(cwd, params) {
   return sections.join("\n\n");
 }
 
+// Shared by every launch mode. Never emits permission bypass, agents, worktrees, or IDE hooks.
 function appendCommonClaudeFlags(
   args,
   params,
-  { defaultPermissionMode, forceReadOnly = false, extraDisallowedTools = [] } = {}
+  { permissionMode, extraDisallowedTools = [], addDirs = [] } = {}
 ) {
-  const permMode = forceReadOnly
-    ? "plan"
-    : params.permission_mode || defaultPermissionMode || "acceptEdits";
-
-  args.push("--permission-mode", permMode);
+  args.push("--permission-mode", permissionMode);
   args.push("--permission-prompts", "none");
-
-  if (!forceReadOnly && permMode === "bypassPermissions") {
-    args.push("--allow-dangerously-skip-permissions");
-  }
 
   if (params.model) args.push("--model", String(params.model));
   if (params.effort) args.push("--effort", String(params.effort));
-  if (params.agent) args.push("--agent", String(params.agent));
 
-  if (params.worktree_name && String(params.worktree_name).trim()) {
-    args.push("--worktree", String(params.worktree_name).trim());
-  } else if (params.worktree) {
-    args.push("--worktree");
-  }
-
-  if (Array.isArray(params.add_dirs)) {
-    for (const dir of params.add_dirs) {
-      if (typeof dir === "string" && dir.trim()) {
-        args.push("--add-dir", path.resolve(dir));
-      }
-    }
-  }
+  for (const dir of addDirs) args.push("--add-dir", dir);
 
   if (Array.isArray(params.allowed_tools) && params.allowed_tools.length > 0) {
     const cleaned = params.allowed_tools.map((t) => String(t).trim()).filter(Boolean);
@@ -655,67 +758,64 @@ function appendCommonClaudeFlags(
     args.push("--max-budget-usd", String(params.max_budget_usd));
   }
 
-  if (params.ide) args.push("--ide");
   if (params.ephemeral) args.push("--no-session-persistence");
 }
 
-function buildClaudeArgs(mode, params, extraDisallowedTools = []) {
+function buildClaudeArgs(mode, params, { extraDisallowedTools = [], tools = [], addDirs = [], callback = null } = {}) {
   const args = ["-p", "--output-format", "stream-json", "--verbose"];
 
-  if (mode === "run") {
-    appendCommonClaudeFlags(args, params, {
-      defaultPermissionMode: "acceptEdits",
+  if (mode === "run" || mode === "resume" || mode === "fork") {
+    if (mode !== "run") args.push("--resume", params.session_id);
+    if (mode === "fork") args.push("--fork-session");
+    args.push("--restricted", "--strict-mcp-config");
+    if (callback) args.push("--mcp-config", callback.config);
+    args.push("--tools", tools.join(","));
+    const canEdit = tools.some((t) => EDIT_TOOLS.includes(t));
+    const ordinaryParams = {
+      model: params.model,
+      effort: params.effort,
+      // Narrowing comes from --tools; pre-approve only the callback server's tools, if registered.
+      allowed_tools: callback ? [`mcp__${CALLBACK_SERVER_NAME}`] : undefined,
+      disallowed_tools: params.disallowed_tools,
+      append_system_prompt: params.append_system_prompt,
+      max_budget_usd: params.max_budget_usd,
+      ephemeral: params.ephemeral,
+    };
+    appendCommonClaudeFlags(args, ordinaryParams, {
+      permissionMode: params.permission_mode ?? (canEdit ? "acceptEdits" : "plan"),
       extraDisallowedTools,
-    });
-    return { args, stdinPrompt: String(params.prompt || "") };
-  }
-
-  if (mode === "resume") {
-    if (params.session_id) {
-      args.push("--resume", String(params.session_id));
-    } else if (params.last) {
-      args.push("--continue");
-    } else {
-      throw new Error("Provide either 'session_id' or 'last: true' for claude_resume.");
-    }
-    appendCommonClaudeFlags(args, params, {
-      defaultPermissionMode: "acceptEdits",
-      extraDisallowedTools,
-    });
-    return { args, stdinPrompt: String(params.prompt || "") };
-  }
-
-  if (mode === "fork") {
-    if (!params.session_id) {
-      throw new Error("'session_id' is required for claude_fork.");
-    }
-    args.push("--resume", String(params.session_id), "--fork-session");
-    appendCommonClaudeFlags(args, params, {
-      defaultPermissionMode: "acceptEdits",
-      extraDisallowedTools,
+      addDirs,
     });
     return { args, stdinPrompt: String(params.prompt || "") };
   }
 
   if (mode === "review") {
+    const fields = TOOLS.find(tool => tool.name === "claude_review").inputSchema.properties;
+    for (const key of Object.keys(params)) {
+      if (key !== "mode" && !Object.hasOwn(fields, key)) throw new Error("Unsupported review parameter: " + key);
+    }
+    if (params.review_diff !== undefined && (typeof params.review_diff !== "string" ||
+        ["base", "commit", "uncommitted"].some(key => Object.hasOwn(params, key)))) {
+      throw new Error("review_diff must be a string and is a separate review target.");
+    }
+    const supported = ["Read", "Glob", "Grep"];
+    const readTools = params.allowed_tools === undefined ? supported : params.allowed_tools;
+    if (!Array.isArray(readTools) || !readTools.every(tool => supported.includes(tool))) {
+      throw new Error("Review allowed_tools must be an array containing only Read, Glob or Grep.");
+    }
+    if (params.disallowed_tools !== undefined && (!Array.isArray(params.disallowed_tools) ||
+        !params.disallowed_tools.every(tool => typeof tool === "string"))) throw new Error("disallowed_tools must be a string array.");
+    args.push("--restricted", "--strict-mcp-config", "--tools", readTools.join(","));
     const reviewParams = {
-      ...params,
-      ephemeral: params.ephemeral !== undefined ? params.ephemeral : true,
-      allowed_tools:
-        Array.isArray(params.allowed_tools) && params.allowed_tools.length > 0
-          ? params.allowed_tools
-          : ["Read", "Glob", "Grep", "Bash(git *)", "PowerShell(git *)"],
-      disallowed_tools: Array.from(
-        new Set([
-          "Edit",
-          "Write",
-          "NotebookEdit",
-          ...(Array.isArray(params.disallowed_tools) ? params.disallowed_tools : []),
-        ])
-      ),
+      model: params.model,
+      effort: params.effort,
+      max_budget_usd: params.max_budget_usd,
+      ephemeral: params.ephemeral ?? true,
+      allowed_tools: readTools,
+      disallowed_tools: params.disallowed_tools,
     };
     appendCommonClaudeFlags(args, reviewParams, {
-      forceReadOnly: true,
+      permissionMode: "plan",
       extraDisallowedTools,
     });
     const stdinPrompt = buildReviewPrompt(params.cwd, params);
@@ -750,28 +850,58 @@ function extractFileChangeRecord(block) {
   return null;
 }
 
-function createRunner(mode, rawParams, policyEval) {
-  const cwd = validateCwd(rawParams.cwd);
-  if (
-    (mode === "run" || mode === "resume" || mode === "fork") &&
-    !String(rawParams.prompt || "").trim()
-  ) {
+function terminateOwnedTree(child, force = true) {
+  if (!child.pid) return;
+  if (process.platform !== "win32") {
+    try { process.kill(-child.pid, force ? "SIGKILL" : "SIGTERM"); }
+    catch (err) { if (err.code !== "ESRCH") throw err; }
+    return;
+  }
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const root = [process.env.SystemRoot, process.env.WINDIR].find(dir => /^[a-z]:[\\/]/i.test(dir ?? ""));
+  if (root && spawnSync(path.join(root, "System32", "taskkill.exe"), ["/T", "/F", "/PID", String(child.pid)], {
+    windowsHide: true, stdio: "ignore", timeout: 2000,
+  }).status === 0) return;
+  try { process.kill(child.pid, 0); } catch (err) { if (err.code === "ESRCH") return; }
+  try { child.kill("SIGKILL"); } catch (err) { if (err.code === "ESRCH") return; }
+  throw new Error("Windows could not confirm process-tree termination.");
+}
+
+function createRunner(mode, rawParams, policyEval, requestSignal) {
+  requestSignal?.throwIfAborted();
+  if (!LAUNCH_MODES.includes(mode)) throw new Error(`Unsupported mode: ${mode}`);
+  const ordinary = mode !== "review";
+  const workspace = loadWorkspacePolicy();
+  const cwd = resolveWorkspaceDir(workspace, rawParams.cwd, "cwd");
+  if (ordinary) validateOrdinaryParams(mode, rawParams);
+  if (ordinary && !String(rawParams.prompt || "").trim()) {
     throw new Error(`'prompt' is required for mode '${mode}'.`);
   }
+  const addDirs = ordinary
+    ? Array.from(new Set((rawParams.add_dirs || []).map((dir, i) => resolveWorkspaceDir(workspace, dir, `add_dirs[${i}]`))))
+    : [];
+  const tools = ordinary ? resolveOrdinaryTools(rawParams, workspace) : [];
+  if (mode === "resume" || mode === "fork") checkSessionReuse(mode, rawParams, cwd, addDirs, tools);
 
   const jobId = crypto.randomUUID().slice(0, 8);
   const downstream = buildDownstreamBridgeConfig(jobId, policyEval);
+  const childWorkspace = { ...workspace, roots: [cwd, ...addDirs], allowEdits: tools.some(t => EDIT_TOOLS.includes(t)) };
+  downstream.env[ROOTS_ENV] = JSON.stringify(childWorkspace.roots);
+  downstream.env[EDITS_ENV] = String(childWorkspace.allowEdits);
+  const callback = ordinary ? buildCallbackMcpConfig(policyEval, downstream, childWorkspace) : null;
   const params = { ...rawParams, cwd };
-  const { args, stdinPrompt } = buildClaudeArgs(
-    mode,
-    params,
-    downstream.extraDisallowedTools
-  );
+  const { args, stdinPrompt } = buildClaudeArgs(mode, params, {
+    extraDisallowedTools: downstream.extraDisallowedTools,
+    tools,
+    addDirs,
+    callback,
+  });
   const invocation = resolveClaudeInvocation(args);
   const timeoutMs = clampTimeoutMs(params.timeout_seconds);
 
   const state = {
     job_id: jobId,
+    ephemeral: Boolean(params.ephemeral ?? !ordinary),
     mode,
     cwd,
     status: "running",
@@ -788,6 +918,12 @@ function createRunner(mode, rawParams, policyEval) {
       max_depth: policyEval.effectiveMaxDepth,
       chain: downstream.nextChain,
       callback_tools_blocked: downstream.extraDisallowedTools,
+    },
+    capabilities: {
+      tools: args[args.indexOf("--tools") + 1].split(",").filter(Boolean),
+      add_dirs: addDirs,
+      workspace_roots: workspace.roots,
+      callback_mcp: callback ? callback.server : null,
     },
     exit_code: null,
     signal: null,
@@ -808,6 +944,7 @@ function createRunner(mode, rawParams, policyEval) {
   };
 
   let stdoutBuffer = "";
+  let receivedResult = false;
   let settled = false;
   let child = null;
   let timer = null;
@@ -891,6 +1028,7 @@ function createRunner(mode, rawParams, policyEval) {
     }
 
     if (evt.type === "result") {
+      receivedResult = true;
       if (typeof evt.result === "string" && evt.result.trim()) {
         state.response = evt.result;
       }
@@ -930,8 +1068,14 @@ function createRunner(mode, rawParams, policyEval) {
   const donePromise = new Promise((resolve) => {
     child = spawn(invocation.command, invocation.args, {
       cwd,
-      env: buildChildEnv(downstream.env),
+      // Nested bridges inherit the same (never wider) workspace ceiling.
+      env: buildChildEnv({
+        ...downstream.env,
+        [ROOTS_ENV]: JSON.stringify(workspace.roots),
+        [EDITS_ENV]: String(workspace.allowEdits),
+      }),
       shell: invocation.shell,
+      detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -939,13 +1083,20 @@ function createRunner(mode, rawParams, policyEval) {
     state.pid = child.pid ?? null;
     activeChildren.add(child);
 
-    let exitGraceTimer = null;
+    let exitGraceTimer = null, forceTimer, confirmationTimer;
+    let stopping = null;
+    let killError = false;
+    const abortRequest = () => state.cancel();
 
-    const finalize = (status, code, signal) => {
+    const finalize = (code, signal) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      clearTimeout(forceTimer);
+      clearTimeout(confirmationTimer);
       if (exitGraceTimer) clearTimeout(exitGraceTimer);
+      requestSignal?.removeEventListener("abort", abortRequest);
+      state.cancel = null;
       activeChildren.delete(child);
 
       try {
@@ -960,44 +1111,45 @@ function createRunner(mode, rawParams, policyEval) {
         stdoutBuffer = "";
       }
 
-      state.status = status;
+      if (!stopping && /unknown option[^\n]*--restricted/i.test(state.stderr)) {
+        state.errors.push("Restricted Claude launches require Claude Code 2.1.248 or newer.");
+      }
+      if (!stopping && code === 0 && !receivedResult) state.errors.push("Claude Code exited without a terminal result.");
+      state.status = killError ? "failed" : stopping || (code === 0 && !state.errors.length ? "completed" : "failed");
       state.exit_code = code;
       state.signal = signal;
       state.completed_at = new Date().toISOString();
       resolve(state);
     };
 
-    state.cancel = () => {
-      if (settled || !child) return false;
-      state.errors.push("Cancelled by caller.");
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // ignore
-      }
-      setTimeout(() => {
-        if (!settled) {
-          try {
-            child.kill("SIGKILL");
-          } catch {
-            // ignore
-          }
-          finalize("cancelled", null, "SIGKILL");
-        }
-      }, 3000).unref();
-      finalize("cancelled", null, "SIGTERM");
+    const signalTree = force => {
+      try { terminateOwnedTree(child, force); }
+      catch (err) { killError = true; state.errors.push(err.message); }
+    };
+    const stop = (status, reason) => {
+      if (settled || stopping) return false;
+      if (child.exitCode !== null || child.signalCode !== null) return false;
+      stopping = status;
+      state.errors.push(reason);
+      child.stdin.destroy();
+      confirmationTimer = setTimeout(() => {
+        if (child.exitCode !== null || child.signalCode !== null) return;
+        state.status = "termination_unconfirmed";
+        state.errors.push("Process termination unconfirmed. Poll job status for the observed exit.");
+        child.stdout.destroy();
+        child.stderr.destroy();
+        // Complete this caller's wait. The job and concurrency slot belong to the process until exit.
+        resolve({ ...state, errors: [...state.errors] });
+      }, 5000);
+      signalTree(process.platform === "win32");
+      if (process.platform !== "win32") forceTimer = setTimeout(() => signalTree(true), 1500);
       return true;
     };
+    state.cancel = () => stop("cancelled", "Cancelled by caller.");
+    requestSignal?.addEventListener("abort", abortRequest, { once: true });
 
     timer = setTimeout(() => {
-      if (settled) return;
-      state.errors.push(`Timed out after ${Math.round(timeoutMs / 1000)}s.`);
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // ignore
-      }
-      finalize("timed_out", null, "SIGTERM");
+      stop("timed_out", `Timed out after ${Math.round(timeoutMs / 1000)}s.`);
     }, timeoutMs);
     timer.unref();
 
@@ -1021,24 +1173,22 @@ function createRunner(mode, rawParams, policyEval) {
 
     child.on("error", (err) => {
       state.errors.push(err.message);
-      finalize("failed", -1, null);
+      if (!child.pid) finalize(-1, null);
     });
 
     child.on("exit", (code, signal) => {
       if (settled || exitGraceTimer) return;
-      exitGraceTimer = setTimeout(() => {
-        if (settled) return;
-        const ok = code === 0 && state.errors.length === 0;
-        finalize(ok ? "completed" : "failed", code, signal);
-      }, 500);
+      clearTimeout(timer);
+      clearTimeout(forceTimer);
+      clearTimeout(confirmationTimer);
+      if (stopping && process.platform !== "win32") signalTree(true);
+      exitGraceTimer = setTimeout(() => finalize(code, signal), 500);
       exitGraceTimer.unref();
     });
 
-    child.on("close", (code, signal) => {
-      const ok = code === 0 && state.errors.length === 0;
-      finalize(ok ? "completed" : "failed", code, signal);
-    });
+    child.on("close", finalize);
 
+    child.stdin.on("error", err => { if (err.code !== "EPIPE") state.errors.push(err.message); });
     if (stdinPrompt !== null) {
       child.stdin.write(stdinPrompt);
     }
@@ -1064,6 +1214,7 @@ function formatStatePayload(state, includeFullOutput = true) {
     model: state.model,
     claude_code_version: state.claude_code_version,
     bridge: state.bridge,
+    capabilities: state.capabilities,
     elapsed_seconds: elapsedSeconds,
     exit_code: state.exit_code,
     num_turns: state.num_turns,
@@ -1144,9 +1295,38 @@ function runQuickCommand(invocation, timeoutMs = 15000) {
 
 const PERMISSION_MODE_SCHEMA = {
   type: "string",
-  enum: ["plan", "acceptEdits", "auto", "dontAsk", "bypassPermissions"],
+  enum: ORDINARY_PERMISSION_MODES,
   description:
-    "Permission mode for headless Claude Code. 'plan' = read-only analysis; 'acceptEdits' (default) = auto-allow workspace file edits (pair with allowed_tools for shell commands); 'auto' = classifier-based auto-approval; 'dontAsk' = deny anything not explicitly allowed; 'bypassPermissions' = unrestricted.",
+    "Permission mode for headless Claude Code. Defaults to 'acceptEdits' when Edit/Write are granted, else 'plan'. 'dontAsk' denies anything not pre-approved. Permission bypass is never available.",
+};
+
+const ORDINARY_TOOLS_SCHEMA = {
+  type: "array",
+  items: { enum: [...READ_TOOLS, ...EDIT_TOOLS] },
+  description:
+    "Optional subset of the host ceiling of built-in tools (Read, Glob, Grep; plus Edit, Write when the host sets AGENT_BRIDGE_ALLOW_EDITS=true). Shell and other tools are never available. Use [] for no tools.",
+};
+
+const ADD_DIRS_SCHEMA = {
+  type: "array",
+  items: { type: "string" },
+  description: "Optional extra absolute directories, each inside the host's AGENT_BRIDGE_WORKSPACE_ROOTS.",
+};
+
+const DISALLOWED_TOOLS_SCHEMA = {
+  type: "array",
+  items: { type: "string" },
+  description: "Optional tool rules to deny in addition to the ceiling.",
+};
+
+const SESSION_ID_SCHEMA = {
+  type: "string",
+  description: "Session UUID returned by an earlier bridge run in the same cwd (this server process).",
+};
+
+const CWD_SCHEMA = {
+  type: "string",
+  description: "Absolute working directory inside the host's AGENT_BRIDGE_WORKSPACE_ROOTS.",
 };
 
 const EFFORT_SCHEMA = {
@@ -1165,7 +1345,7 @@ const TOOLS = [
   {
     name: "claude_run",
     description:
-      "Run a local Claude Code agent synchronously on a task and return its final response, session_id (for resuming/forking), commands executed, file changes, permission denials, cost, and token usage.",
+      "Run a restricted local Claude Code agent synchronously on a task (built-in tools limited to the host ceiling: Read, Glob, Grep, plus Edit/Write only when the host enables edits; no shell) and return its final response, session_id (for resuming/forking), file changes, permission denials, cost, and token usage.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1173,10 +1353,7 @@ const TOOLS = [
           type: "string",
           description: "Complete task instructions for the Claude Code agent.",
         },
-        cwd: {
-          type: "string",
-          description: "Absolute path to the repository or working directory.",
-        },
+        cwd: CWD_SCHEMA,
         permission_mode: PERMISSION_MODE_SCHEMA,
         model: {
           type: "string",
@@ -1184,47 +1361,16 @@ const TOOLS = [
             "Optional model override (e.g. 'sonnet', 'opus', 'haiku', or full model name; defaults to user's Claude Code config).",
         },
         effort: EFFORT_SCHEMA,
-        worktree: {
-          type: "boolean",
-          description:
-            "Run Claude Code in a new managed Git worktree to isolate edits from the main working tree.",
-        },
-        worktree_name: {
-          type: "string",
-          description: "Optional name for the managed Git worktree (implies worktree: true).",
-        },
-        add_dirs: {
-          type: "array",
-          items: { type: "string" },
-          description: "Optional extra directories Claude Code can access alongside cwd.",
-        },
-        allowed_tools: {
-          type: "array",
-          items: { type: "string" },
-          description:
-            "Optional list of pre-approved tool specs for unattended execution (e.g. ['Read', 'Edit', 'Write', 'Bash(npm test)', 'Bash(git *)']).",
-        },
-        disallowed_tools: {
-          type: "array",
-          items: { type: "string" },
-          description: "Optional list of tools to explicitly deny (e.g. ['Bash(rm *)', 'WebFetch']).",
-        },
+        add_dirs: ADD_DIRS_SCHEMA,
+        allowed_tools: ORDINARY_TOOLS_SCHEMA,
+        disallowed_tools: DISALLOWED_TOOLS_SCHEMA,
         append_system_prompt: {
           type: "string",
           description: "Optional extra instructions appended to Claude Code's system prompt.",
         },
-        agent: {
-          type: "string",
-          description: "Optional custom Claude Code agent name to use for the session.",
-        },
         max_budget_usd: {
           type: "number",
           description: "Optional maximum dollar budget for this run.",
-        },
-        ide: {
-          type: "boolean",
-          description:
-            "Automatically connect to a running local Claude Code IDE extension on startup if one is available.",
         },
         ephemeral: {
           type: "boolean",
@@ -1242,78 +1388,56 @@ const TOOLS = [
   {
     name: "claude_resume",
     description:
-      "Continue an existing local Claude Code session by session_id (or the most recent session in cwd with last: true) with follow-up instructions.",
+      "Continue a finished Claude Code session that this bridge process started in the same cwd, under the same restricted tool ceiling as claude_run.",
     inputSchema: {
       type: "object",
       properties: {
-        session_id: {
-          type: "string",
-          description: "Session UUID returned from an earlier claude_run or claude_spawn call.",
-        },
-        last: {
-          type: "boolean",
-          description:
-            "Resume the most recent Claude Code session in cwd (--continue) when session_id is omitted.",
-        },
+        session_id: SESSION_ID_SCHEMA,
         prompt: {
           type: "string",
           description: "Follow-up prompt for the resumed Claude Code session.",
         },
-        cwd: {
-          type: "string",
-          description: "Absolute path to the working directory.",
-        },
+        cwd: CWD_SCHEMA,
         permission_mode: PERMISSION_MODE_SCHEMA,
         model: { type: "string", description: "Optional model override." },
         effort: EFFORT_SCHEMA,
-        worktree: { type: "boolean", description: "Run in a managed Git worktree." },
-        worktree_name: { type: "string", description: "Optional Git worktree name." },
-        add_dirs: { type: "array", items: { type: "string" } },
-        allowed_tools: { type: "array", items: { type: "string" } },
-        disallowed_tools: { type: "array", items: { type: "string" } },
+        add_dirs: ADD_DIRS_SCHEMA,
+        allowed_tools: ORDINARY_TOOLS_SCHEMA,
+        disallowed_tools: DISALLOWED_TOOLS_SCHEMA,
+        append_system_prompt: { type: "string" },
         max_budget_usd: { type: "number" },
-        ide: { type: "boolean" },
+        ephemeral: { type: "boolean" },
         bridge_context: BRIDGE_CONTEXT_SCHEMA,
         timeout_seconds: {
           type: "number",
           description: "Timeout in seconds (default 600, max 1800).",
         },
       },
-      required: ["prompt", "cwd"],
+      required: ["session_id", "prompt", "cwd"],
     },
   },
   {
     name: "claude_fork",
     description:
-      "Fork an existing local Claude Code session into a new independent thread (--fork-session) with new instructions.",
+      "Fork a Claude Code session that this bridge process started in the same cwd into a new thread (--fork-session), under the same restricted tool ceiling as claude_run.",
     inputSchema: {
       type: "object",
       properties: {
-        session_id: {
-          type: "string",
-          description: "Existing Claude Code session UUID to fork.",
-        },
+        session_id: SESSION_ID_SCHEMA,
         prompt: {
           type: "string",
           description: "Instructions for the forked branch.",
         },
-        cwd: {
-          type: "string",
-          description: "Absolute path to the working directory.",
-        },
+        cwd: CWD_SCHEMA,
         permission_mode: PERMISSION_MODE_SCHEMA,
         model: { type: "string", description: "Optional model override." },
         effort: EFFORT_SCHEMA,
-        worktree: {
-          type: "boolean",
-          description: "Run the forked session in a new managed Git worktree.",
-        },
-        worktree_name: { type: "string", description: "Optional Git worktree name." },
-        add_dirs: { type: "array", items: { type: "string" } },
-        allowed_tools: { type: "array", items: { type: "string" } },
-        disallowed_tools: { type: "array", items: { type: "string" } },
+        add_dirs: ADD_DIRS_SCHEMA,
+        allowed_tools: ORDINARY_TOOLS_SCHEMA,
+        disallowed_tools: DISALLOWED_TOOLS_SCHEMA,
+        append_system_prompt: { type: "string" },
         max_budget_usd: { type: "number" },
-        ide: { type: "boolean" },
+        ephemeral: { type: "boolean" },
         bridge_context: BRIDGE_CONTEXT_SCHEMA,
         timeout_seconds: {
           type: "number",
@@ -1326,13 +1450,17 @@ const TOOLS = [
   {
     name: "claude_review",
     description:
-      "Run a non-interactive read-only code review with local Claude Code against uncommitted changes, a base branch, or a specific commit.",
+      "Run a restricted read-only Claude Code review of uncommitted changes, a base branch, a commit, or a supplied diff.",
     inputSchema: {
       type: "object",
       properties: {
+        review_diff: { type: "string", description: "Prepared diff. When supplied, the bridge skips Git in cwd." },
+        allowed_tools: { type: "array", items: { enum: ["Read", "Glob", "Grep"] }, description: "Use [] for a diff-only review." },
+        disallowed_tools: { type: "array", items: { type: "string" } },
+        ephemeral: { type: "boolean" },
         cwd: {
           type: "string",
-          description: "Absolute path to the Git repository.",
+          description: "Absolute working directory inside the host's AGENT_BRIDGE_WORKSPACE_ROOTS. A supplied review_diff does not require a Git repository.",
         },
         uncommitted: {
           type: "boolean",
@@ -1374,6 +1502,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
+        review_diff: { type: "string", description: "Prepared diff when mode is review." },
         mode: {
           type: "string",
           enum: ["run", "resume", "fork", "review"],
@@ -1383,34 +1512,20 @@ const TOOLS = [
           type: "string",
           description: "Task instructions (required for run, resume, fork; optional for review).",
         },
-        cwd: {
-          type: "string",
-          description: "Absolute path to the working directory.",
-        },
-        session_id: {
-          type: "string",
-          description: "Session UUID when mode is 'resume' or 'fork'.",
-        },
-        last: {
-          type: "boolean",
-          description: "Resume most recent session in cwd when mode is 'resume' without session_id.",
-        },
+        cwd: CWD_SCHEMA,
+        session_id: SESSION_ID_SCHEMA,
         permission_mode: PERMISSION_MODE_SCHEMA,
         model: { type: "string", description: "Optional model override." },
         effort: EFFORT_SCHEMA,
-        worktree: {
-          type: "boolean",
-          description:
-            "Recommended when spawning multiple parallel editing Claude Code agents in the same repo.",
+        add_dirs: ADD_DIRS_SCHEMA,
+        allowed_tools: {
+          type: "array",
+          items: { enum: [...READ_TOOLS, ...EDIT_TOOLS] },
+          description: "Subset of the host tool ceiling (review mode: Read, Glob, Grep only).",
         },
-        worktree_name: { type: "string" },
-        add_dirs: { type: "array", items: { type: "string" } },
-        allowed_tools: { type: "array", items: { type: "string" } },
-        disallowed_tools: { type: "array", items: { type: "string" } },
+        disallowed_tools: DISALLOWED_TOOLS_SCHEMA,
         append_system_prompt: { type: "string" },
-        agent: { type: "string" },
         max_budget_usd: { type: "number" },
-        ide: { type: "boolean" },
         uncommitted: { type: "boolean" },
         base: { type: "string" },
         commit: { type: "string" },
@@ -1475,7 +1590,7 @@ function getVisibleTools() {
   return TOOLS.filter((t) => !SPAWN_DELEGATING_TOOLS.has(t.name));
 }
 
-async function handleToolCall(name, args = {}) {
+async function handleToolCall(name, args = {}, requestSignal) {
   const policyEval = evaluateDelegationPolicy(name, args);
   if (!policyEval.allowed) {
     return {
@@ -1498,7 +1613,7 @@ async function handleToolCall(name, args = {}) {
 
   switch (name) {
     case "claude_run": {
-      const { donePromise } = createRunner("run", args, policyEval);
+      const { donePromise } = createRunner("run", args, policyEval, requestSignal);
       const result = await donePromise;
       return {
         content: [{ type: "text", text: JSON.stringify(formatStatePayload(result, true), null, 2) }],
@@ -1507,7 +1622,7 @@ async function handleToolCall(name, args = {}) {
     }
 
     case "claude_resume": {
-      const { donePromise } = createRunner("resume", args, policyEval);
+      const { donePromise } = createRunner("resume", args, policyEval, requestSignal);
       const result = await donePromise;
       return {
         content: [{ type: "text", text: JSON.stringify(formatStatePayload(result, true), null, 2) }],
@@ -1516,7 +1631,7 @@ async function handleToolCall(name, args = {}) {
     }
 
     case "claude_fork": {
-      const { donePromise } = createRunner("fork", args, policyEval);
+      const { donePromise } = createRunner("fork", args, policyEval, requestSignal);
       const result = await donePromise;
       return {
         content: [{ type: "text", text: JSON.stringify(formatStatePayload(result, true), null, 2) }],
@@ -1525,7 +1640,7 @@ async function handleToolCall(name, args = {}) {
     }
 
     case "claude_review": {
-      const { donePromise } = createRunner("review", args, policyEval);
+      const { donePromise } = createRunner("review", args, policyEval, requestSignal);
       const result = await donePromise;
       return {
         content: [{ type: "text", text: JSON.stringify(formatStatePayload(result, true), null, 2) }],
@@ -1548,6 +1663,7 @@ async function handleToolCall(name, args = {}) {
                 pid: state.pid,
                 cwd: state.cwd,
                 bridge: state.bridge,
+                capabilities: state.capabilities,
                 started_at: state.started_at,
               },
               null,
@@ -1575,7 +1691,7 @@ async function handleToolCall(name, args = {}) {
               text: JSON.stringify(formatStatePayload(job, includeFull), null, 2),
             },
           ],
-          isError: job.status === "failed" || job.status === "timed_out",
+          isError: ["failed", "timed_out", "termination_unconfirmed"].includes(job.status),
         };
       }
 
@@ -1648,6 +1764,7 @@ async function handleToolCall(name, args = {}) {
         auth: authParsed,
         auth_error: authRes.ok ? undefined : authRes.stderr || `exit ${authRes.code}`,
         bridge: getBridgePolicy(),
+        workspace: describeWorkspacePolicy(loadWorkspacePolicy()),
       };
       return {
         content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
@@ -1680,7 +1797,11 @@ async function handleRequest(msg) {
       return;
     }
 
-    if (method === "notifications/initialized" || method === "notifications/cancelled") {
+    if (method === "notifications/cancelled") {
+      requestControllers.get(params?.requestId)?.abort();
+      return;
+    }
+    if (method === "notifications/initialized") {
       return;
     }
 
@@ -1697,8 +1818,14 @@ async function handleRequest(msg) {
     if (method === "tools/call") {
       const toolName = params?.name;
       const toolArgs = params?.arguments || {};
-      const result = await handleToolCall(toolName, toolArgs);
-      sendResult(id, result);
+      const controller = new AbortController();
+      requestControllers.set(id, controller);
+      try {
+        const result = await handleToolCall(toolName, toolArgs, controller.signal);
+        sendResult(id, result);
+      } finally {
+        requestControllers.delete(id);
+      }
       return;
     }
 
@@ -1717,9 +1844,9 @@ async function handleRequest(msg) {
 function shutdown() {
   for (const child of activeChildren) {
     try {
-      child.kill("SIGTERM");
-    } catch {
-      // ignore
+      terminateOwnedTree(child);
+    } catch (err) {
+      log(err.message);
     }
   }
   activeChildren.clear();

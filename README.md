@@ -1,6 +1,6 @@
 # Antigravity ↔ Claude Code Bridge
 
-Two zero-dependency Node.js Model Context Protocol (MCP) connectors that let **Google Antigravity** and **Anthropic Claude Code** delegate work to each other locally — independently, in a strict **primary/subordinate hierarchy**, or in guarded **bidirectional peer mode**.
+Two zero-dependency Node.js Model Context Protocol (MCP) connectors link a locally running **Google Antigravity IDE** and your locally installed **Anthropic Claude Code CLI**. The `antigravity-to-claude` plugin spawns local Claude CLI processes from Antigravity, while `claude-to-antigravity` sends local RPC calls from Claude Code into the running Antigravity IDE. You can install one connector on its own, enforce a **primary/subordinate hierarchy**, or run guarded **bidirectional peer mode**.
 
 ```text
 ┌─────────────────────────────┐         antigravity-to-claude         ┌─────────────────────────────┐
@@ -96,6 +96,8 @@ Antigravity automatically discovers plugins under `~/.gemini/config/plugins/`. V
 
 Register the MCP server with Claude Code:
 
+The default registration supports inspection. To launch IDE work, use the explicit registration example below and replace the workspace path with your own.
+
 #### Independent / Default
 ```bash
 claude mcp add --scope user antigravity -- node /path/to/antigravity-claude-bridge/claude-to-antigravity/server/index.mjs
@@ -105,6 +107,8 @@ claude mcp add --scope user antigravity -- node /path/to/antigravity-claude-brid
 ```bash
 claude mcp add --scope user antigravity \
   -e AGENT_BRIDGE_ROLE=peer \
+  -e AGENT_BRIDGE_ALLOW_EDITS=true \
+  -e 'AGENT_BRIDGE_WORKSPACE_ROOTS=["/absolute/path/to/project"]' \
   -e AGENT_BRIDGE_MAX_DEPTH=1 \
   -e AGENT_BRIDGE_ALLOW_CYCLES=false \
   -e AGENT_BRIDGE_MAX_CONCURRENT=4 \
@@ -167,6 +171,7 @@ Use this when you want to start from **either** Antigravity or Claude Code and d
 - **Cycle guard (`AGENT_BRIDGE_ALLOW_CYCLES=false`):** Every hop appends `<agent>:<id>` to `AGENT_BRIDGE_CHAIN`. Neither side will delegate back to an agent already present in the chain.
 - **Concurrency cap (`AGENT_BRIDGE_MAX_CONCURRENT=4`):** Prevents fan-out snowballs (tracked per process in `antigravity-to-claude` and per machine via `ANTIGRAVITY_MCP_STATE_DIR/spawned.json` in `claude-to-antigravity`).
 - **Callback stripping at max depth:** When Antigravity launches Claude at `depth + 1 >= max_depth`, it automatically adds `--disallowedTools mcp__antigravity__*`.
+- **Callback registration:** Claude launches use `--strict-mcp-config`, so they never load a globally registered `antigravity` server. In `peer` mode below max depth, `claude-local` registers the callback itself, but only from `claude-to-antigravity/server/index.mjs` in the same installation (a checkout or a symlinked plugin). A copied plugin directory has no callback. With the default `MAX_DEPTH=1`, no callback is registered.
 - **In-band RPC propagation:** Because Claude → Antigravity calls run over Antigravity's local RPC server (where child env vars cannot cross), `claude-to-antigravity` embeds `[bridge: origin=claude role=... depth=... max_depth=... chain=...]` into the delegation header.
 - **No self-approval:** `antigravity_respond` is automatically disabled whenever `AGENT_BRIDGE_DEPTH > 0` or `AGENT_BRIDGE_ROLE=subordinate`, so a delegated worker can never approve its own parent's prompts.
 
@@ -175,6 +180,8 @@ Use this when you want to start from **either** Antigravity or Claude Code and d
 ## Configuration Reference
 
 ### Shared Bridge Environment Variables (Both Connectors)
+
+Both connectors accept `AGENT_BRIDGE_CONTEXT` from their host registration as a version 1 JSON envelope containing an ordered `hops` array of `{from, to, id}` objects and a nonnegative `remaining_hops` count. Each child handoff spends one hop and applies the tighter of the incoming and local limits. Older registrations using depth and a comma-separated sender history are translated when that history is complete. The IDE carries this context in its existing prompt marker. Its registration sets the local limit even when the caller omits that marker.
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
@@ -185,12 +192,16 @@ Use this when you want to start from **either** Antigravity or Claude Code and d
 | `AGENT_BRIDGE_ALLOW_CYCLES` | `false` | Set to `true` only if you intentionally allow `A → B → A` callbacks within `MAX_DEPTH`. |
 | `AGENT_BRIDGE_MAX_CONCURRENT` | `4` | Maximum concurrent active delegated runs/jobs per connector. |
 | `AGENT_BRIDGE_HIDE_RESTRICTED_TOOLS` | `false` | When `true` in `subordinate` mode, omits restricted delegating tools from `tools/list` in addition to refusing them in `tools/call`. |
+| `AGENT_BRIDGE_WORKSPACE_ROOTS` | `[<server cwd>]` | JSON array of absolute existing directories. Launch directories (`cwd`, `add_dirs`, `antigravity_spawn` `cwd`) must resolve inside one after following symlinks. If the server cwd is a volume root, you must set this explicitly. |
+| `AGENT_BRIDGE_ALLOW_EDITS` | `false` | Exactly `true` or `false`. Permits `Edit` and `Write` in Claude CLI. Set it to `true` to launch or steer an Antigravity IDE agent using the IDE's permissions. |
+
+An invalid value for either of the last two refuses launches (`claude_*` runs, `antigravity_spawn`). Status, wait, and cancel tools keep working. Each connector ships its own copy of `server/workspace-policy.mjs`, so you can install either half alone.
 
 ### Connector-Specific Environment Variables
 
 | Variable | Connector | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `CLAUDE_CLI_BIN` | `antigravity-to-claude` | *(auto-discovered)* | Explicit path to `claude` / `claude.exe`. Leave unset to auto-pick the newest version. |
+| `CLAUDE_CLI_BIN` | `antigravity-to-claude` | *(auto-discovered)* | Absolute path to the Claude CLI. On Windows, use a native `.exe` or JavaScript entry point. When unset, the bridge checks standalone installs and PATH before bundled copies. |
 | `AGENT_BRIDGE_CALLBACK_DISALLOWED_TOOLS` | `antigravity-to-claude` | `mcp__antigravity__*` | Comma-separated Claude tool patterns passed to `--disallowedTools` when blocking callbacks. |
 | `ANTIGRAVITY_LS_ADDRESS` | `claude-to-antigravity` | *(auto-discovered)* | Manual `host:port` override for Antigravity's local language server. |
 | `ANTIGRAVITY_CSRF_TOKEN` | `claude-to-antigravity` | *(auto-discovered)* | Manual CSRF token override (pair with `ANTIGRAVITY_LS_ADDRESS`). |
@@ -252,13 +263,13 @@ If a desktop GUI app does not inherit your shell's `PATH`, pin the full `node` b
 | Tool | Description |
 | :--- | :--- |
 | `claude_status` | Reports resolved binary, version, `claude auth status`, and active `AGENT_BRIDGE_*` policy. |
-| `claude_run` | Runs a scoped local Claude Code task synchronously (`permission_mode`, `model`, `effort`, `worktree`, `allowed_tools`, `ide`, `max_budget_usd`, `ephemeral`). |
-| `claude_resume` | Continues an earlier Claude Code thread by `session_id` or `last: true` (`--continue`). |
-| `claude_fork` | Branches an existing Claude Code session into a new independent thread (`--fork-session`). |
-| `claude_review` | Non-interactive, strictly read-only (`plan` mode) code review of uncommitted changes, a `base` branch diff, or a `commit`. |
+| `claude_run` | Runs a restricted local Claude Code task synchronously. Tools are capped at `Read`, `Glob`, and `Grep`, plus `Edit`/`Write` when the host allows edits. Accepts `permission_mode` (`plan`, `acceptEdits`, `dontAsk`), `model`, `effort`, `add_dirs`, an `allowed_tools` subset, `max_budget_usd`, and `ephemeral`. |
+| `claude_resume` | Continues a finished session that this server launched in the same `cwd`, under the same ceiling. |
+| `claude_fork` | Branches a session that this server launched in the same `cwd` (`--fork-session`), under the same ceiling. |
+| `claude_review` | Runs a restricted read-only review (requires Claude Code CLI `>=2.1.248`) limited to `Read`, `Glob`, and `Grep`, or an `allowed_tools` subset (`[]` for diff-only). Accepts `uncommitted`, `base`, `commit`, or a caller-supplied string `review_diff`. |
 | `claude_spawn` | Launches a Claude Code agent asynchronously in the background for parallel fan-out. |
-| `claude_job_status` | Polls a background job by `job_id` or lists all tracked jobs. |
-| `claude_job_cancel` | Cancels a running background job. |
+| `claude_job_status` | Polls a Claude CLI job by `job_id` (including exit checks after `termination_unconfirmed`) or lists all tracked jobs. |
+| `claude_job_cancel` | Requests cancellation and returns the job ID and current status. Poll `claude_job_status` to see when the process exits. |
 
 ### Claude Code → Antigravity (`antigravity`)
 
@@ -271,17 +282,27 @@ If a desktop GUI app does not inherit your shell's `PATH`, pin the full `node` b
 | `antigravity_result` | Fetches the final response, step summary, or full Markdown transcript of a conversation. |
 | `antigravity_list` | Lists Antigravity conversations (optionally filtered to bridge-spawned runs). |
 | `antigravity_cancel` | Cancels an active Antigravity conversation (or entire subagent tree with `force_tree`). |
-| `antigravity_respond` | Responds to a pending generic permission prompt (automatically disabled at `depth > 0` or in `subordinate` mode). |
+| `antigravity_respond` | Responds to a pending generic permission prompt in the IDE (automatically disabled at `depth > 0` or in `subordinate` mode). Approve built-in terminal, browser, and other non-generic prompts inside the Antigravity IDE. |
 | `antigravity_models` | Lists models currently configured in Antigravity. |
 | `antigravity_bridge_status` | Reports active `AGENT_BRIDGE_*` policy, refused tools, active spawn count, and next-hop `[bridge: ...]` marker. |
 
-See [`antigravity-to-claude/README.md`](antigravity-to-claude/README.md) and [`claude-to-antigravity/README.md`](claude-to-antigravity/README.md) for connector-specific details.
+Ordinary `claude_run`, `claude_resume`, `claude_fork`, and `claude_spawn` launches use the workspace and tool ceiling described in [`antigravity-to-claude/README.md`](antigravity-to-claude/README.md#workspace-and-tool-ceiling-claude_run-claude_resume-claude_fork-claude_spawn). For an untrusted checkout, pass a prepared `review_diff` from a trusted source and set `allowed_tools` to `[]`. This skips local Git configuration and filters during diff collection and gives the reviewer only the supplied text.
+
+If the bridge cannot confirm exit within five seconds of a cancellation or timeout, a waiting Claude call returns `termination_unconfirmed`. Use its `job_id` to check progress. The bridge releases the concurrency slot automatically when it observes the process exit.
+
+Delegated `claude-to-antigravity` runs execute inside the running Antigravity IDE and inherit your IDE permissions, including terminal execution. The Claude CLI tool ceiling does not apply to them. The bridge checks `cwd` before a spawn and verifies all workspace directories reported by the IDE before a follow-up or approval. Once a turn starts, file and terminal access follow the IDE's settings. See [`antigravity-to-claude/README.md`](antigravity-to-claude/README.md) and [`claude-to-antigravity/README.md`](claude-to-antigravity/README.md) for connector-specific details.
 
 ---
 
 ## Verifying Both Servers Locally
 
-Run the MCP stdio handshake against either server:
+Run the test suites from the repository root.
+
+```bash
+node --test tests/claude-runner.test.mjs tests/workspace-policy.test.mjs
+```
+
+You can also run the MCP stdio handshake against either server.
 
 ```bash
 # Test Antigravity → Claude Code server

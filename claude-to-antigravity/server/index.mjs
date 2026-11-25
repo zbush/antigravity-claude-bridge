@@ -7,11 +7,13 @@
 //
 // Delegation policy follows the shared AGENT_BRIDGE_* contract (see ../README.md).
 
-import crypto from 'node:crypto';
+import { followupPolicy, nextContext, registeredContext } from './context.mjs';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { describeWorkspacePolicy, loadWorkspacePolicy, resolveWorkspaceDir } from './workspace-policy.mjs';
 
 const SERVER_NAME = 'antigravity';
 const SERVER_VERSION = '0.3.0';
@@ -65,20 +67,25 @@ function loadBridgePolicy(env = process.env) {
   const maxConcurrent = int('AGENT_BRIDGE_MAX_CONCURRENT', 4, 1);
   const chainRaw = raw('AGENT_BRIDGE_CHAIN');
   const chain = chainRaw ? chainRaw.split(',').map((h) => h.trim()).filter(Boolean) : [];
-  const badHop = chain.find((h) => !/^[^:,\s]+:[^,\s]+$/.test(h));
-  if (badHop) errors.push(`AGENT_BRIDGE_CHAIN hop "${badHop}" must look like <agent>:<id>`);
+  let context;
+  try { context = registeredContext(env, 'claude', depth, chain, maxDepth); }
+  catch (error) { errors.push(error.message); }
   const allowCycles = bool('AGENT_BRIDGE_ALLOW_CYCLES');
   const hideRestricted = bool('AGENT_BRIDGE_HIDE_RESTRICTED_TOOLS');
 
   return {
-    role, depth, maxDepth, maxConcurrent, chain, allowCycles, hideRestricted, errors,
-    // This process's hop in the chain it passes downstream.
-    hop: `claude:${crypto.randomBytes(4).toString('hex')}`,
+    role, depth: context?.hops.length ?? depth, maxDepth, maxConcurrent,
+    chain: context?.hops.map(h => h.from + ':' + h.id) ?? chain, context, allowCycles, hideRestricted, errors,
   };
 }
 
 const BRIDGE = loadBridgePolicy();
 if (BRIDGE.errors.length) log('invalid AGENT_BRIDGE_* configuration; mutating tools disabled:', BRIDGE.errors.join('; '));
+
+// Workspace ceiling for the cwd of new spawns. Antigravity agents run with the IDE's own permissions,
+// so the operator must opt in before a request can launch or steer one.
+const WORKSPACE = loadWorkspacePolicy();
+if (WORKSPACE.errors.length) log('invalid workspace configuration; antigravity_spawn disabled:', WORKSPACE.errors.join('; '));
 
 const isAntigravityHop = (h) => h.toLowerCase().startsWith('antigravity:');
 
@@ -92,10 +99,13 @@ function restrictions(p = BRIDGE) {
   if (p.role === 'subordinate') {
     add(MUTATING_TOOLS, 'AGENT_BRIDGE_ROLE=subordinate: this session is a delegated worker and may only inspect Antigravity conversations, not start, steer, stop or approve them');
   }
+  const ideWork = [...DELEGATING_TOOLS, 'antigravity_respond'];
+  if (WORKSPACE.errors.length) add(ideWork, WORKSPACE.errors.join('; '));
+  else if (!WORKSPACE.allowEdits) add(ideWork, 'set AGENT_BRIDGE_ALLOW_EDITS=true to allow work with the IDE permissions');
   if (p.depth > 0) {
     add(['antigravity_respond'], `AGENT_BRIDGE_DEPTH=${p.depth}: a delegated worker must never approve permission prompts`);
   }
-  if (p.role !== 'independent' && p.depth >= p.maxDepth) {
+  if (p.depth >= p.maxDepth || p.context?.remaining_hops === 0) {
     add(DELEGATING_TOOLS, `delegation depth limit reached (AGENT_BRIDGE_DEPTH=${p.depth} >= AGENT_BRIDGE_MAX_DEPTH=${p.maxDepth})`);
   }
   if (!p.allowCycles && p.chain.some(isAntigravityHop)) {
@@ -111,11 +121,12 @@ function refusal(tool, why) {
 
 // The policy the downstream Antigravity agent is told to follow.
 function downstream(p = BRIDGE) {
-  const depth = p.depth + 1;
+  const context = nextContext(p.context, 'claude', 'antigravity', p.maxDepth - p.depth);
+  const depth = context.hops.length;
   const role = p.role === 'independent' ? 'independent'
-    : p.role === 'primary' || depth >= p.maxDepth ? 'subordinate'
+    : p.role === 'primary' || context.remaining_hops === 0 ? 'subordinate'
     : 'peer';
-  return { role, depth, maxDepth: p.maxDepth, chain: [...p.chain, p.hop].join(',') };
+  return { role, depth, maxDepth: depth + context.remaining_hops, chain: context.hops.map(h => h.from + ':' + h.id).join(','), context };
 }
 
 // ---------------------------------------------------------------- delegation labeling
@@ -130,8 +141,13 @@ const REPORT_FOOTER =
   '\n\n---\nWhen you are finished, end with a concise final report: what you did, files you changed, ' +
   'how you verified it, and anything unresolved. This final message is what the requester will read.';
 
+function markerLine(down) {
+  const encoded = Buffer.from(JSON.stringify(down.context)).toString('base64url');
+  return `[bridge: origin=claude role=${down.role} depth=${down.depth} max_depth=${down.maxDepth} chain=${down.chain} ctx=${encoded}]`;
+}
+
 function delegationHeader(down) {
-  const marker = `[bridge: origin=claude role=${down.role} depth=${down.depth} max_depth=${down.maxDepth} chain=${down.chain}]`;
+  const marker = markerLine(down);
   let policy = '';
   if (down.role === 'subordinate') {
     policy =
@@ -235,17 +251,34 @@ function toFileUri(p) {
 }
 
 function fromFileUri(u) {
-  try { return fileURLToPath(decodeURIComponent(u).replace(/^file:\/\/\/([a-z]):/i, 'file:///$1:')); } catch { return u; }
+  try { return fileURLToPath(u.replace(/^file:\/\/\/([a-z])%3a\//i, 'file:///$1:/')); } catch { return u; }
+}
+
+function checkConversationWorkspaces(info) {
+  if (!Array.isArray(info.workspaces) || !info.workspaces.length) throw new Error('The IDE did not report workspace roots for this conversation.');
+  for (const workspace of info.workspaces) {
+    resolveWorkspaceDir(WORKSPACE, fromFileUri(workspace.workspaceFolderAbsoluteUri), 'conversation workspace');
+  }
 }
 
 function loadSpawned() {
-  try { return JSON.parse(fs.readFileSync(SPAWNED_FILE, 'utf8')); } catch { return {}; }
+  try { return JSON.parse(fs.readFileSync(SPAWNED_FILE, 'utf8')); }
+  catch (error) {
+    if (error.code === 'ENOENT') return {};
+    throw new Error('Cannot read Antigravity bridge conversation state: ' + error.message);
+  }
 }
 function saveSpawned(id, info) {
   const all = loadSpawned();
   all[id] = { ...(all[id] || {}), ...info };
   fs.mkdirSync(STATE_DIR, { recursive: true });
-  fs.writeFileSync(SPAWNED_FILE, JSON.stringify(all, null, 1));
+  const temp = SPAWNED_FILE + '.' + randomUUID() + '.tmp';
+  try {
+    fs.writeFileSync(temp, JSON.stringify(all, null, 1), { flag: 'wx' });
+    fs.renameSync(temp, SPAWNED_FILE);
+  } finally {
+    fs.rmSync(temp, { force: true });
+  }
 }
 
 const shortStatus = (s) => (s || 'UNKNOWN').replace(/^CASCADE_RUN_STATUS_/, '').toLowerCase();
@@ -478,7 +511,7 @@ const tools = {
       type: 'object',
       properties: {
         prompt: { type: 'string', description: 'Complete, self-contained task brief for the agent. A header marking it as delegated by Claude Code (not typed by the user) is added automatically.' },
-        cwd: { type: 'string', description: 'Absolute path of the workspace folder the agent should work in.' },
+        cwd: { type: 'string', description: 'Absolute path of the workspace folder the agent should work in. Must be inside the host\'s AGENT_BRIDGE_WORKSPACE_ROOTS.' },
         title: { type: 'string', description: 'Optional short title for the Antigravity Agent Manager; always prefixed with "[Claude] ". Defaults to the first line of the prompt.' },
         model: { type: 'string', description: 'Optional model: label, model id, or substring (see antigravity_models). Defaults to the IDE default.' },
         wait: { type: 'boolean', description: 'Block until the agent finishes and return its final response. Default false.' },
@@ -489,8 +522,11 @@ const tools = {
     },
     async run({ prompt, cwd, title, model, wait = false, timeout_seconds = 600, append_report_instructions = true }) {
       if (!prompt || !cwd) throw new Error('prompt and cwd are required.');
-      if (!path.isAbsolute(cwd)) throw new Error('cwd must be an absolute path.');
-      if (!fs.existsSync(cwd)) throw new Error(`cwd does not exist: ${cwd}`);
+      try {
+        cwd = resolveWorkspaceDir(WORKSPACE, cwd, 'cwd');
+      } catch (e) {
+        throw new PolicyError(refusal('antigravity_spawn', e.message.replace(/\.$/, '')));
+      }
       const cascadeConfig = await buildConfig(model);
       const down = downstream();
       const shownTitle = delegatedTitle(title, prompt);
@@ -535,8 +571,15 @@ const tools = {
     },
     async run({ conversation_id, message, model, wait = false, timeout_seconds = 600 }) {
       const before = await summary(conversation_id);
+      checkConversationWorkspaces(before);
       const cascadeConfig = await buildConfig(model);
-      await rpc('SendUserCascadeMessage', { cascadeId: conversation_id, items: [{ text: FOLLOWUP_HEADER + message }], cascadeConfig });
+      const current = downstream();
+      const original = loadSpawned()[conversation_id]?.bridge;
+      const down = original ? followupPolicy(current, original) : current;
+      if (original && (down.role !== original.role || down.maxDepth !== original.maxDepth)) {
+        saveSpawned(conversation_id, { bridge: down });
+      }
+      await rpc('SendUserCascadeMessage', { cascadeId: conversation_id, items: [{ text: FOLLOWUP_HEADER + markerLine(down) + '\n\n' + message }], cascadeConfig });
       if (!wait) return { conversation_id, status: 'running', note: 'Message sent.' };
       const w = await waitFor([conversation_id], { timeoutSeconds: timeout_seconds, baselines: { [conversation_id]: before.stepCount || 0 } });
       return { ...(await report(conversation_id)), timed_out: w.timedOut };
@@ -667,6 +710,7 @@ const tools = {
     async run({ conversation_id, allow, scope = 'once', deny_reason, step_index }) {
       const s = await summary(conversation_id);
       const waiting = s.waitingSteps || [];
+      checkConversationWorkspaces(s);
       const w = step_index === undefined ? waiting[0] : waiting.find((x) => (x.stepIndex ?? x.index) === step_index);
       if (!w) throw new Error('That conversation is not waiting on any approval.');
       const ri = w.step?.requestedInteraction || {};
@@ -700,6 +744,7 @@ const tools = {
     async run() {
       let active;
       try { active = (await activeSpawned()).length; } catch (e) { active = `unknown (${e.message})`; }
+      const preview = restrictions().antigravity_spawn ? null : downstream();
       return {
         role: BRIDGE.role,
         depth: BRIDGE.depth,
@@ -709,10 +754,14 @@ const tools = {
         max_concurrent: BRIDGE.maxConcurrent,
         active_spawned: active,
         hide_restricted_tools: BRIDGE.hideRestricted,
-        hop: BRIDGE.hop,
-        next_spawn_marker: downstream(),
+        hop: preview?.chain.split(',').at(-1) ?? null,
+        next_spawn_marker: preview,
         refused_tools: restrictions(),
         config_errors: BRIDGE.errors.length ? BRIDGE.errors : undefined,
+        workspace: {
+          ...describeWorkspacePolicy(WORKSPACE),
+          note: 'Roots limit the cwd of new antigravity_spawn calls only. Agents use the IDE\'s own permissions; existing conversations are not limited.',
+        },
       };
     },
   },
