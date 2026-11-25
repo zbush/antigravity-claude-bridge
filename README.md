@@ -103,12 +103,12 @@ claude mcp add --scope user antigravity -- node /path/to/antigravity-claude-brid
 
 #### With Explicit Bridge Role / Environment Variables
 ```bash
-claude mcp add --scope user \
+claude mcp add --scope user antigravity \
   -e AGENT_BRIDGE_ROLE=peer \
   -e AGENT_BRIDGE_MAX_DEPTH=1 \
   -e AGENT_BRIDGE_ALLOW_CYCLES=false \
   -e AGENT_BRIDGE_MAX_CONCURRENT=4 \
-  antigravity -- node /path/to/antigravity-claude-bridge/claude-to-antigravity/server/index.mjs
+  -- node /path/to/antigravity-claude-bridge/claude-to-antigravity/server/index.mjs
 ```
 
 > Keep the server name `antigravity` so Claude Code exposes its tools as `mcp__antigravity__*`, which the hierarchy presets target with `AGENT_BRIDGE_CALLBACK_DISALLOWED_TOOLS="mcp__antigravity__*"`. Or edit your Claude Code MCP config (`~/.claude.json` under `mcpServers.antigravity`) using one of the JSON templates in [`presets/`](presets/).
