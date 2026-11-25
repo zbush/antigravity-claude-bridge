@@ -17,6 +17,11 @@ import { describeWorkspacePolicy, loadWorkspacePolicy, resolveWorkspaceDir } fro
 
 const SERVER_NAME = 'antigravity';
 const SERVER_VERSION = '0.3.0';
+const iconFile = new URL('../assets/icon-64.png', import.meta.url);
+const icons = fs.existsSync(iconFile) ? [{
+  src: 'data:image/png;base64,' + fs.readFileSync(iconFile, 'base64'),
+  mimeType: 'image/png', sizes: ['64x64'],
+}] : [];
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_CONFIG_FILE = path.join(HERE, '..', 'default-cascade-config.json');
 const AG_DIR = process.env.ANTIGRAVITY_DATA_DIR || path.join(os.homedir(), '.gemini', 'antigravity');
@@ -794,7 +799,7 @@ async function handle(msg) {
         result = {
           protocolVersion: params?.protocolVersion || '2025-06-18',
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
+          serverInfo: { name: SERVER_NAME, version: SERVER_VERSION, icons },
           instructions: serverInstructions(),
         };
         break;
