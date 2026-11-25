@@ -1,6 +1,6 @@
 # claude-to-antigravity
 
-An MCP server that lets **Claude Code** (or any MCP client) hand work to agents in a locally running **Google Antigravity** IDE. You can spawn agents in parallel, collect their results, steer them, and stop them, without spending Claude's context on long investigations.
+An MCP server that lets the **Claude Code CLI** (or any MCP client) delegate work over local RPC to agents inside a running **Google Antigravity IDE**. You can spawn IDE agents in parallel, collect their results, send follow-ups, and cancel runs while keeping long investigations out of Claude's context.
 
 - One file, no dependencies: `server/index.mjs` (Node 18+).
 - Works on its own. You don't need the `antigravity-to-claude` half of this repo.
@@ -58,7 +58,7 @@ Antigravity's language server serves a local Connect/JSON RPC API on `127.0.0.1`
 | approve a permission prompt | `HandleCascadeUserInteraction` |
 | models | `GetCascadeModelConfigData` |
 
-The IDE sends a full agent config (tools, hooks, terminal policy, model) with every message. The bridge copies that config from your most recent Antigravity conversation, so spawned agents behave like ones you start yourself. If it can't read one, it falls back to `default-cascade-config.json`. That file has no pinned model, so the IDE default model applies.
+The IDE sends a full agent config (tools, hooks, terminal policy, model) with every message. The bridge copies that config from your most recent Antigravity conversation, so delegated agents inherit your running Antigravity IDE permissions and terminal auto-execution policy. Those IDE permissions operate independently of Claude Code CLI settings and `claude_review` restrictions. When no recent conversation config is available, the bridge falls back to `default-cascade-config.json` and lets the IDE default model apply.
 
 Spawned agents appear in the Antigravity Agent Manager, where you can watch or take over any of them.
 
@@ -69,7 +69,7 @@ Spawned agents appear in the Antigravity Agent Manager, where you can watch or t
 | `antigravity_spawn` | delegating | Start an agent on a self-contained brief in `cwd` (optionally `model`, `title`, `wait`) |
 | `antigravity_send` | delegating | Send a follow-up message to an existing conversation |
 | `antigravity_cancel` | mutating | Stop an agent (`force_tree` also stops its sub-agents) |
-| `antigravity_respond` | mutating | Allow or deny a pending generic permission prompt |
+| `antigravity_respond` | mutating | Allow or deny a pending generic permission prompt (approve built-in terminal, browser, and other non-generic prompts inside the Antigravity IDE) |
 | `antigravity_wait` | read-only | Wait for one or more agents (`all` / `any`) and return their final responses |
 | `antigravity_status` | read-only | Status, pending approvals and final response |
 | `antigravity_result` | read-only | Final message, compact step log, or full markdown transcript |
@@ -179,8 +179,8 @@ On Windows, `$HOME` means `%USERPROFILE%`.
 
 ## Notes and limits
 
-- Antigravity must be running.
+- The Antigravity IDE must be running locally. This connector calls the running IDE over loopback RPC and reports the IDE's own conversation states.
 - The bridge uses an internal, undocumented API that Antigravity's own UI and agent CLI also use. An Antigravity update could change it.
-- Agents run with your Antigravity permissions, including its terminal auto-execution policy.
-- `antigravity_respond` only handles generic permission prompts. Approve command, browser and other prompts in the Antigravity window.
+- Delegated agents inherit your running Antigravity IDE permissions, including its terminal auto-execution policy, independent of Claude Code CLI permissions or `claude_review` restrictions.
+- `antigravity_respond` handles generic permission prompts only. Approve built-in terminal commands, browser actions, and other non-generic prompts inside the Antigravity IDE window.
 - Logs go to stderr with the prefix `[claude-to-antigravity]`.

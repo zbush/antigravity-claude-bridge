@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -26,6 +26,7 @@ const MUTATING_TOOLS = new Set([...SPAWN_DELEGATING_TOOLS, "claude_job_cancel"])
 
 const jobs = new Map();
 const activeChildren = new Set();
+const requestControllers = new Map();
 
 function log(message) {
   process.stderr.write(`[${SERVER_NAME}] ${message}\n`);
@@ -205,7 +206,7 @@ function evaluateDelegationPolicy(toolName, rawParams = {}) {
     };
   }
 
-  const runningCount = Array.from(jobs.values()).filter((j) => j.status === "running").length;
+  const runningCount = activeChildren.size;
   if (runningCount >= policy.maxConcurrent) {
     return {
       allowed: false,
@@ -332,7 +333,7 @@ function findClaudeInExtensionsDir(extDir, binaryName) {
 
 function findOnPath(binaryNames) {
   const pathEnv = process.env.PATH || "";
-  const dirs = pathEnv.split(path.delimiter).filter(Boolean);
+  const dirs = pathEnv.split(path.delimiter).map(dir => dir.replace(/^"|"$/g, "")).filter(dir => path.isAbsolute(dir));
   for (const dir of dirs) {
     for (const name of binaryNames) {
       const full = path.join(dir, name);
@@ -355,7 +356,13 @@ function discoverClaudeBinary() {
 
   // 1. Explicit env override
   const configured = process.env.CLAUDE_CLI_BIN;
-  if (configured && fs.existsSync(configured)) {
+  if (configured) {
+    if (!path.isAbsolute(configured) || !fs.statSync(configured, { throwIfNoEntry: false })?.isFile()) {
+      throw new Error("CLAUDE_CLI_BIN must point to an existing absolute file.");
+    }
+    if (isWin && !/\.(exe|[cm]?js)$/i.test(configured)) {
+      throw new Error("CLAUDE_CLI_BIN must point to a Windows .exe or JavaScript CLI entry point.");
+    }
     return { path: configured, source: "CLAUDE_CLI_BIN" };
   }
 
@@ -370,7 +377,7 @@ function discoverClaudeBinary() {
     }
   }
 
-  const fromPath = findOnPath(isWin ? ["claude.exe", "claude.cmd"] : ["claude"]);
+  const fromPath = findOnPath(isWin ? ["claude.exe", path.join("node_modules", "@anthropic-ai", "claude-code", "cli.js")] : ["claude"]);
   if (fromPath) {
     return { path: fromPath, source: "PATH" };
   }
@@ -443,41 +450,14 @@ function discoverClaudeBinary() {
 
 function resolveClaudeInvocation(claudeArgs) {
   const discovered = discoverClaudeBinary();
-  if (discovered) {
-    if (process.platform === "win32" && discovered.path.toLowerCase().endsWith(".cmd")) {
-      return {
-        command: "cmd.exe",
-        args: ["/d", "/s", "/c", discovered.path, ...claudeArgs],
-        shell: false,
-        binary: discovered.path,
-        source: discovered.source,
-      };
-    }
-    return {
-      command: discovered.path,
-      args: claudeArgs,
-      shell: false,
-      binary: discovered.path,
-      source: discovered.source,
-    };
-  }
-
-  if (process.platform === "win32") {
-    return {
-      command: "cmd.exe",
-      args: ["/d", "/s", "/c", "claude", ...claudeArgs],
-      shell: false,
-      binary: "claude",
-      source: "fallback-path",
-    };
-  }
-
+  if (!discovered) throw new Error("Cannot find Claude Code. Set CLAUDE_CLI_BIN to its absolute executable path.");
+  const useNode = /\.[cm]?js$/i.test(discovered.path);
   return {
-    command: "claude",
-    args: claudeArgs,
+    command: useNode ? process.execPath : discovered.path,
+    args: useNode ? [discovered.path, ...claudeArgs] : claudeArgs,
     shell: false,
-    binary: "claude",
-    source: "fallback-path",
+    binary: discovered.path,
+    source: discovered.source,
   };
 }
 
@@ -510,7 +490,9 @@ function validateCwd(cwd) {
 
 function runGitSafe(cwd, gitArgs) {
   try {
-    return execFileSync("git", gitArgs, {
+    const git = findOnPath([process.platform === "win32" ? "git.exe" : "git"]);
+    if (!git) throw new Error("Cannot find Git on PATH.");
+    return execFileSync(git, ["--no-optional-locks", "-c", "core.fsmonitor=false", ...gitArgs], {
       cwd,
       encoding: "utf8",
       maxBuffer: 10 * 1024 * 1024,
@@ -525,6 +507,7 @@ function runGitSafe(cwd, gitArgs) {
 
 function buildReviewPrompt(cwd, params) {
   const sections = [];
+  const diffOnly = params.allowed_tools?.length === 0;
   if (params.title) {
     sections.push(`# Review Title: ${String(params.title).trim()}`);
   }
@@ -534,20 +517,25 @@ function buildReviewPrompt(cwd, params) {
   let gitContextError = null;
 
   try {
-    if (params.commit) {
+    if (params.review_diff !== undefined) {
+      targetDescription = "the supplied diff";
+      diffContent = params.review_diff;
+    } else if (params.commit) {
       const sha = String(params.commit).trim();
       targetDescription = `commit ${sha}`;
-      diffContent = runGitSafe(cwd, ["show", "--stat", "--patch", sha]);
+      const commit = runGitSafe(cwd, ["rev-parse", "--verify", "--end-of-options", sha + "^{commit}"]).trim();
+      diffContent = runGitSafe(cwd, ["show", "--no-ext-diff", "--no-textconv", "--stat", "--patch", commit, "--"]);
     } else if (params.base) {
       const base = String(params.base).trim();
       targetDescription = `branch diff against '${base}' (${base}...HEAD)`;
-      const stat = runGitSafe(cwd, ["diff", "--stat", `${base}...HEAD`]);
-      const patch = runGitSafe(cwd, ["diff", `${base}...HEAD`]);
+      const commit = runGitSafe(cwd, ["rev-parse", "--verify", "--end-of-options", base + "^{commit}"]).trim();
+      const stat = runGitSafe(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--stat", `${commit}...HEAD`, "--"]);
+      const patch = runGitSafe(cwd, ["diff", "--no-ext-diff", "--no-textconv", `${commit}...HEAD`, "--"]);
       diffContent = `${stat}\n${patch}`.trim();
     } else {
       const status = runGitSafe(cwd, ["status", "--short"]);
-      const staged = runGitSafe(cwd, ["diff", "--cached"]);
-      const unstaged = runGitSafe(cwd, ["diff"]);
+      const staged = runGitSafe(cwd, ["diff", "--no-ext-diff", "--no-textconv", "--cached"]);
+      const unstaged = runGitSafe(cwd, ["diff", "--no-ext-diff", "--no-textconv"]);
       const parts = [];
       if (status.trim()) parts.push(`## git status --short\n${status.trim()}`);
       if (staged.trim()) parts.push(`## Staged diff (git diff --cached)\n${staged.trim()}`);
@@ -555,7 +543,11 @@ function buildReviewPrompt(cwd, params) {
       diffContent = parts.join("\n\n");
     }
   } catch (err) {
+    if (diffOnly) throw new Error("Cannot prepare the diff for a diff-only review: " + err.message);
     gitContextError = err instanceof Error ? err.message : String(err);
+  }
+  if (diffOnly && diffContent.length > MAX_REVIEW_DIFF_CHARS) {
+    throw new Error("Diff-only review accepts at most " + MAX_REVIEW_DIFF_CHARS + " characters. Split the diff and review each part.");
   }
 
   sections.push(
@@ -563,7 +555,7 @@ function buildReviewPrompt(cwd, params) {
       `Perform a thorough, read-only code review of ${targetDescription} in ${cwd}.`,
       "Focus on correctness bugs, regressions, security issues, edge cases, race conditions, missing error handling, and test coverage gaps.",
       "Cite exact file paths and line numbers for each finding, ordered by severity (Critical / High / Medium / Low).",
-      "Do NOT modify any files. You may read surrounding files in the repository for context.",
+      diffOnly ? "Base the review on the supplied diff alone." : "You may read surrounding files in the repository for context. Do not modify files.",
     ].join("\n")
   );
 
@@ -698,21 +690,29 @@ function buildClaudeArgs(mode, params, extraDisallowedTools = []) {
   }
 
   if (mode === "review") {
+    const fields = TOOLS.find(tool => tool.name === "claude_review").inputSchema.properties;
+    for (const key of Object.keys(params)) {
+      if (key !== "mode" && !Object.hasOwn(fields, key)) throw new Error("Unsupported review parameter: " + key);
+    }
+    if (params.review_diff !== undefined && (typeof params.review_diff !== "string" ||
+        ["base", "commit", "uncommitted"].some(key => Object.hasOwn(params, key)))) {
+      throw new Error("review_diff must be a string and is a separate review target.");
+    }
+    const supported = ["Read", "Glob", "Grep"];
+    const readTools = params.allowed_tools === undefined ? supported : params.allowed_tools;
+    if (!Array.isArray(readTools) || !readTools.every(tool => supported.includes(tool))) {
+      throw new Error("Review allowed_tools must be an array containing only Read, Glob or Grep.");
+    }
+    if (params.disallowed_tools !== undefined && (!Array.isArray(params.disallowed_tools) ||
+        !params.disallowed_tools.every(tool => typeof tool === "string"))) throw new Error("disallowed_tools must be a string array.");
+    args.push("--restricted", "--strict-mcp-config", "--tools", readTools.join(","));
     const reviewParams = {
-      ...params,
-      ephemeral: params.ephemeral !== undefined ? params.ephemeral : true,
-      allowed_tools:
-        Array.isArray(params.allowed_tools) && params.allowed_tools.length > 0
-          ? params.allowed_tools
-          : ["Read", "Glob", "Grep", "Bash(git *)", "PowerShell(git *)"],
-      disallowed_tools: Array.from(
-        new Set([
-          "Edit",
-          "Write",
-          "NotebookEdit",
-          ...(Array.isArray(params.disallowed_tools) ? params.disallowed_tools : []),
-        ])
-      ),
+      model: params.model,
+      effort: params.effort,
+      max_budget_usd: params.max_budget_usd,
+      ephemeral: params.ephemeral ?? true,
+      allowed_tools: readTools,
+      disallowed_tools: params.disallowed_tools,
     };
     appendCommonClaudeFlags(args, reviewParams, {
       forceReadOnly: true,
@@ -750,7 +750,25 @@ function extractFileChangeRecord(block) {
   return null;
 }
 
-function createRunner(mode, rawParams, policyEval) {
+function terminateOwnedTree(child, force = true) {
+  if (!child.pid) return;
+  if (process.platform !== "win32") {
+    try { process.kill(-child.pid, force ? "SIGKILL" : "SIGTERM"); }
+    catch (err) { if (err.code !== "ESRCH") throw err; }
+    return;
+  }
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const root = [process.env.SystemRoot, process.env.WINDIR].find(dir => /^[a-z]:[\\/]/i.test(dir ?? ""));
+  if (root && spawnSync(path.join(root, "System32", "taskkill.exe"), ["/T", "/F", "/PID", String(child.pid)], {
+    windowsHide: true, stdio: "ignore", timeout: 2000,
+  }).status === 0) return;
+  try { process.kill(child.pid, 0); } catch (err) { if (err.code === "ESRCH") return; }
+  try { child.kill("SIGKILL"); } catch (err) { if (err.code === "ESRCH") return; }
+  throw new Error("Windows could not confirm process-tree termination.");
+}
+
+function createRunner(mode, rawParams, policyEval, requestSignal) {
+  requestSignal?.throwIfAborted();
   const cwd = validateCwd(rawParams.cwd);
   if (
     (mode === "run" || mode === "resume" || mode === "fork") &&
@@ -808,6 +826,7 @@ function createRunner(mode, rawParams, policyEval) {
   };
 
   let stdoutBuffer = "";
+  let receivedResult = false;
   let settled = false;
   let child = null;
   let timer = null;
@@ -891,6 +910,7 @@ function createRunner(mode, rawParams, policyEval) {
     }
 
     if (evt.type === "result") {
+      receivedResult = true;
       if (typeof evt.result === "string" && evt.result.trim()) {
         state.response = evt.result;
       }
@@ -932,6 +952,7 @@ function createRunner(mode, rawParams, policyEval) {
       cwd,
       env: buildChildEnv(downstream.env),
       shell: invocation.shell,
+      detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -939,13 +960,20 @@ function createRunner(mode, rawParams, policyEval) {
     state.pid = child.pid ?? null;
     activeChildren.add(child);
 
-    let exitGraceTimer = null;
+    let exitGraceTimer = null, forceTimer, confirmationTimer;
+    let stopping = null;
+    let killError = false;
+    const abortRequest = () => state.cancel();
 
-    const finalize = (status, code, signal) => {
+    const finalize = (code, signal) => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      clearTimeout(forceTimer);
+      clearTimeout(confirmationTimer);
       if (exitGraceTimer) clearTimeout(exitGraceTimer);
+      requestSignal?.removeEventListener("abort", abortRequest);
+      state.cancel = null;
       activeChildren.delete(child);
 
       try {
@@ -960,44 +988,45 @@ function createRunner(mode, rawParams, policyEval) {
         stdoutBuffer = "";
       }
 
-      state.status = status;
+      if (!stopping && /unknown option[^\n]*--restricted/i.test(state.stderr)) {
+        state.errors.push("Restricted review requires Claude Code 2.1.248 or newer.");
+      }
+      if (!stopping && code === 0 && !receivedResult) state.errors.push("Claude Code exited without a terminal result.");
+      state.status = killError ? "failed" : stopping || (code === 0 && !state.errors.length ? "completed" : "failed");
       state.exit_code = code;
       state.signal = signal;
       state.completed_at = new Date().toISOString();
       resolve(state);
     };
 
-    state.cancel = () => {
-      if (settled || !child) return false;
-      state.errors.push("Cancelled by caller.");
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // ignore
-      }
-      setTimeout(() => {
-        if (!settled) {
-          try {
-            child.kill("SIGKILL");
-          } catch {
-            // ignore
-          }
-          finalize("cancelled", null, "SIGKILL");
-        }
-      }, 3000).unref();
-      finalize("cancelled", null, "SIGTERM");
+    const signalTree = force => {
+      try { terminateOwnedTree(child, force); }
+      catch (err) { killError = true; state.errors.push(err.message); }
+    };
+    const stop = (status, reason) => {
+      if (settled || stopping) return false;
+      if (child.exitCode !== null || child.signalCode !== null) return false;
+      stopping = status;
+      state.errors.push(reason);
+      child.stdin.destroy();
+      confirmationTimer = setTimeout(() => {
+        if (child.exitCode !== null || child.signalCode !== null) return;
+        state.status = "termination_unconfirmed";
+        state.errors.push("Process termination unconfirmed. Poll job status for the observed exit.");
+        child.stdout.destroy();
+        child.stderr.destroy();
+        // Complete this caller's wait. The job and concurrency slot belong to the process until exit.
+        resolve({ ...state, errors: [...state.errors] });
+      }, 5000);
+      signalTree(process.platform === "win32");
+      if (process.platform !== "win32") forceTimer = setTimeout(() => signalTree(true), 1500);
       return true;
     };
+    state.cancel = () => stop("cancelled", "Cancelled by caller.");
+    requestSignal?.addEventListener("abort", abortRequest, { once: true });
 
     timer = setTimeout(() => {
-      if (settled) return;
-      state.errors.push(`Timed out after ${Math.round(timeoutMs / 1000)}s.`);
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // ignore
-      }
-      finalize("timed_out", null, "SIGTERM");
+      stop("timed_out", `Timed out after ${Math.round(timeoutMs / 1000)}s.`);
     }, timeoutMs);
     timer.unref();
 
@@ -1021,24 +1050,22 @@ function createRunner(mode, rawParams, policyEval) {
 
     child.on("error", (err) => {
       state.errors.push(err.message);
-      finalize("failed", -1, null);
+      if (!child.pid) finalize(-1, null);
     });
 
     child.on("exit", (code, signal) => {
       if (settled || exitGraceTimer) return;
-      exitGraceTimer = setTimeout(() => {
-        if (settled) return;
-        const ok = code === 0 && state.errors.length === 0;
-        finalize(ok ? "completed" : "failed", code, signal);
-      }, 500);
+      clearTimeout(timer);
+      clearTimeout(forceTimer);
+      clearTimeout(confirmationTimer);
+      if (stopping && process.platform !== "win32") signalTree(true);
+      exitGraceTimer = setTimeout(() => finalize(code, signal), 500);
       exitGraceTimer.unref();
     });
 
-    child.on("close", (code, signal) => {
-      const ok = code === 0 && state.errors.length === 0;
-      finalize(ok ? "completed" : "failed", code, signal);
-    });
+    child.on("close", finalize);
 
+    child.stdin.on("error", err => { if (err.code !== "EPIPE") state.errors.push(err.message); });
     if (stdinPrompt !== null) {
       child.stdin.write(stdinPrompt);
     }
@@ -1326,13 +1353,17 @@ const TOOLS = [
   {
     name: "claude_review",
     description:
-      "Run a non-interactive read-only code review with local Claude Code against uncommitted changes, a base branch, or a specific commit.",
+      "Run a restricted read-only Claude Code review of uncommitted changes, a base branch, a commit, or a supplied diff.",
     inputSchema: {
       type: "object",
       properties: {
+        review_diff: { type: "string", description: "Prepared diff. When supplied, the bridge skips Git in cwd." },
+        allowed_tools: { type: "array", items: { enum: ["Read", "Glob", "Grep"] }, description: "Use [] for a diff-only review." },
+        disallowed_tools: { type: "array", items: { type: "string" } },
+        ephemeral: { type: "boolean" },
         cwd: {
           type: "string",
-          description: "Absolute path to the Git repository.",
+          description: "Absolute working directory. A supplied review_diff does not require a Git repository.",
         },
         uncommitted: {
           type: "boolean",
@@ -1374,6 +1405,7 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
+        review_diff: { type: "string", description: "Prepared diff when mode is review." },
         mode: {
           type: "string",
           enum: ["run", "resume", "fork", "review"],
@@ -1475,7 +1507,7 @@ function getVisibleTools() {
   return TOOLS.filter((t) => !SPAWN_DELEGATING_TOOLS.has(t.name));
 }
 
-async function handleToolCall(name, args = {}) {
+async function handleToolCall(name, args = {}, requestSignal) {
   const policyEval = evaluateDelegationPolicy(name, args);
   if (!policyEval.allowed) {
     return {
@@ -1498,7 +1530,7 @@ async function handleToolCall(name, args = {}) {
 
   switch (name) {
     case "claude_run": {
-      const { donePromise } = createRunner("run", args, policyEval);
+      const { donePromise } = createRunner("run", args, policyEval, requestSignal);
       const result = await donePromise;
       return {
         content: [{ type: "text", text: JSON.stringify(formatStatePayload(result, true), null, 2) }],
@@ -1507,7 +1539,7 @@ async function handleToolCall(name, args = {}) {
     }
 
     case "claude_resume": {
-      const { donePromise } = createRunner("resume", args, policyEval);
+      const { donePromise } = createRunner("resume", args, policyEval, requestSignal);
       const result = await donePromise;
       return {
         content: [{ type: "text", text: JSON.stringify(formatStatePayload(result, true), null, 2) }],
@@ -1516,7 +1548,7 @@ async function handleToolCall(name, args = {}) {
     }
 
     case "claude_fork": {
-      const { donePromise } = createRunner("fork", args, policyEval);
+      const { donePromise } = createRunner("fork", args, policyEval, requestSignal);
       const result = await donePromise;
       return {
         content: [{ type: "text", text: JSON.stringify(formatStatePayload(result, true), null, 2) }],
@@ -1525,7 +1557,7 @@ async function handleToolCall(name, args = {}) {
     }
 
     case "claude_review": {
-      const { donePromise } = createRunner("review", args, policyEval);
+      const { donePromise } = createRunner("review", args, policyEval, requestSignal);
       const result = await donePromise;
       return {
         content: [{ type: "text", text: JSON.stringify(formatStatePayload(result, true), null, 2) }],
@@ -1575,7 +1607,7 @@ async function handleToolCall(name, args = {}) {
               text: JSON.stringify(formatStatePayload(job, includeFull), null, 2),
             },
           ],
-          isError: job.status === "failed" || job.status === "timed_out",
+          isError: ["failed", "timed_out", "termination_unconfirmed"].includes(job.status),
         };
       }
 
@@ -1680,7 +1712,11 @@ async function handleRequest(msg) {
       return;
     }
 
-    if (method === "notifications/initialized" || method === "notifications/cancelled") {
+    if (method === "notifications/cancelled") {
+      requestControllers.get(params?.requestId)?.abort();
+      return;
+    }
+    if (method === "notifications/initialized") {
       return;
     }
 
@@ -1697,8 +1733,14 @@ async function handleRequest(msg) {
     if (method === "tools/call") {
       const toolName = params?.name;
       const toolArgs = params?.arguments || {};
-      const result = await handleToolCall(toolName, toolArgs);
-      sendResult(id, result);
+      const controller = new AbortController();
+      requestControllers.set(id, controller);
+      try {
+        const result = await handleToolCall(toolName, toolArgs, controller.signal);
+        sendResult(id, result);
+      } finally {
+        requestControllers.delete(id);
+      }
       return;
     }
 
@@ -1717,9 +1759,9 @@ async function handleRequest(msg) {
 function shutdown() {
   for (const child of activeChildren) {
     try {
-      child.kill("SIGTERM");
-    } catch {
-      // ignore
+      terminateOwnedTree(child);
+    } catch (err) {
+      log(err.message);
     }
   }
   activeChildren.clear();
