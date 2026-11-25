@@ -16,6 +16,11 @@ import {
 
 const SERVER_NAME = "claude-local";
 const SERVER_VERSION = "1.1.0";
+const iconFile = new URL("../assets/icon-64.png", import.meta.url);
+const icons = fs.existsSync(iconFile) ? [{
+  src: "data:image/png;base64," + fs.readFileSync(iconFile, "base64"),
+  mimeType: "image/png", sizes: ["64x64"],
+}] : [];
 const DEFAULT_PROTOCOL_VERSION = "2024-11-05";
 const DEFAULT_TIMEOUT_SECONDS = 600;
 const MAX_TIMEOUT_SECONDS = 1800;
@@ -1792,7 +1797,7 @@ async function handleRequest(msg) {
       sendResult(id, {
         protocolVersion: requestedVersion,
         capabilities: { tools: {} },
-        serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
+        serverInfo: { name: SERVER_NAME, version: SERVER_VERSION, icons },
       });
       return;
     }

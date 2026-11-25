@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="antigravity-to-claude/assets/logo.png" alt="Claude pixel robot with a terminal prompt beneath the Antigravity arch" width="128" height="128" />
+</p>
+
 # Antigravity ↔ Claude Code Bridge
 
 Two zero-dependency Node.js Model Context Protocol (MCP) connectors link a locally running **Google Antigravity IDE** and your locally installed **Anthropic Claude Code CLI**. The `antigravity-to-claude` plugin spawns local Claude CLI processes from Antigravity, while `claude-to-antigravity` sends local RPC calls from Claude Code into the running Antigravity IDE. You can install one connector on its own, enforce a **primary/subordinate hierarchy**, or run guarded **bidirectional peer mode**.
@@ -26,7 +30,7 @@ antigravity-claude-bridge/
 ├── antigravity-to-claude/                     # Antigravity plugin (Antigravity → Claude Code)
 │   ├── plugin.json
 │   ├── mcp_config.json
-│   ├── assets/logo.svg
+│   ├── assets/logo.png
 │   ├── server/index.mjs
 │   └── skills/claude-orchestration/SKILL.md
 ├── claude-to-antigravity/                     # Claude Code MCP server (Claude Code → Antigravity)
